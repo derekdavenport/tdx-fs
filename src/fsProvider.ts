@@ -43,14 +43,16 @@ export class Directory implements vscode.FileStat {
 
 	name: string;
 	entries: Map<string, File | Directory>;
+	baseUrl?: string;  // Store metadata like the HTML Modules page URL
 
-	constructor(name: string) {
+	constructor(name: string, baseUrl?: string) {
 		this.type = vscode.FileType.Directory;
 		this.ctime = Date.now();
 		this.mtime = Date.now();
 		this.size = 0;
 		this.name = name;
 		this.entries = new Map();
+		this.baseUrl = baseUrl;
 	}
 }
 
@@ -60,6 +62,7 @@ export class TdxFS implements vscode.FileSystemProvider {
 
 	root = new Directory('');
 	private session?: TdxSession;
+	private moduleRefreshCallback?: () => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>;
 
 	setSession(session: TdxSession | undefined): void {
 		this.session = session;
@@ -67,6 +70,10 @@ export class TdxFS implements vscode.FileSystemProvider {
 
 	getSession(): TdxSession | undefined {
 		return this.session;
+	}
+
+	setModuleRefreshCallback(callback: () => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>): void {
+		this.moduleRefreshCallback = callback;
 	}
 
 	private async fetchWithCookieJar(url: string, options?: RequestInit): Promise<Response> {
@@ -109,12 +116,26 @@ export class TdxFS implements vscode.FileSystemProvider {
 			throw new Error('No active TeamDynamix session');
 		}
 
-		const entry = this.root.entries.get(fileName);
-		if (!entry || entry instanceof Directory) {
+		// Find the file - first check in HTML Modules directory
+		let file: File | undefined;
+		
+		const htmlModulesDir = this.root.entries.get('HTML Modules');
+		if (htmlModulesDir && htmlModulesDir instanceof Directory) {
+			file = htmlModulesDir.entries.get(fileName) as File;
+		}
+		
+		// Fallback check in root for compatibility
+		if (!file) {
+			const entry = this.root.entries.get(fileName);
+			if (entry && entry instanceof File) {
+				file = entry;
+			}
+		}
+		
+		if (!file) {
 			throw new Error(`File not found: "${fileName}"`);
 		}
 
-		const file = entry as File;
 		if (!file.url) {
 			throw new Error(`No URL found for file: ${fileName}`);
 		}
@@ -159,19 +180,53 @@ export class TdxFS implements vscode.FileSystemProvider {
 			throw new Error('No active TeamDynamix session');
 		}
 
-		// Extract the base path from the file URL to construct the save endpoint
-		const entry = this.root.entries.get(fileName);
-		if (!entry || entry instanceof Directory) {
+		// Find the file - first check in HTML Modules directory
+		let file: File | undefined;
+		let parentDir: Directory | undefined;
+		
+		const htmlModulesDir = this.root.entries.get('HTML Modules');
+		if (htmlModulesDir && htmlModulesDir instanceof Directory) {
+			file = htmlModulesDir.entries.get(fileName) as File;
+			if (file) {
+				parentDir = htmlModulesDir;
+			}
+		}
+		
+		// Fallback check in root for compatibility
+		if (!file) {
+			const entry = this.root.entries.get(fileName);
+			if (entry && entry instanceof File) {
+				file = entry;
+				parentDir = this.root;
+			}
+		}
+		
+		if (!file) {
 			throw new Error(`File not found: "${fileName}"`);
 		}
-
-		const file = entry as File;
-		if (!file.url) {
-			throw new Error(`No URL found for file: ${fileName}`);
+		
+		// For new files without a URL, construct a default URL with moduleId = 0
+		let moduleId = '0';
+		let editPageUrl: string;
+		
+		if (file.url) {
+			editPageUrl = file.url;
+			// Extract the moduleId from the URL if it exists
+			const moduleIdMatch = file.url.match(/modID=(\d+)/i);
+			moduleId = moduleIdMatch ? moduleIdMatch[1] : '0';
+		} else {
+			// New module - use the parent directory's baseUrl if available (for HTML Modules)
+			if (parentDir?.baseUrl) {
+				// Extract the base path from the htmlModulesPageUrl and append 
+				const baseUrlPath = parentDir.baseUrl.replace(/^([^?]*).*$/, '$1');
+				editPageUrl = new URL('HtmlModuleEdit', baseUrlPath).toString();
+			} else {
+				throw new Error(`Cannot determine edit page URL for new file: "${fileName}"`);
+			}
 		}
 
 		// Fetch the edit page to extract all form fields
-		const fullUrl = new URL(file.url, session.baseUrl).toString();
+		const fullUrl = new URL(editPageUrl, session.baseUrl).toString();
 		const response = await this.fetchWithCookieJar(fullUrl, {
 			redirect: 'manual'  // Don't follow redirects automatically
 		});
@@ -194,6 +249,12 @@ export class TdxFS implements vscode.FileSystemProvider {
 			return match ? match[1] : '';
 		};
 
+		const getCheckboxValue = (fieldName: string): string => {
+			const regex = new RegExp(`<input[^>]*name="${fieldName}"[^>]*value="([^"]*)"`);
+			const match = html.match(regex);
+			return match && match[0].includes('checked="checked"') ? 'true' : 'false';
+		};
+
 		const getSelectValue = (fieldName: string): string => {
 			const regex = new RegExp(`<select[^>]*name="${fieldName}"[^>]*>([\\s\\S]*?)<option[^>]*selected[^>]*value="([^"]*)"`);
 			const match = html.match(regex);
@@ -207,30 +268,27 @@ export class TdxFS implements vscode.FileSystemProvider {
 			throw new Error('Could not extract verification token from edit page');
 		}
 
-		// Get the base path by removing the query string
-		const baseUrl = file.url.split('?')[0];
-		const basePath = baseUrl.substring(0, baseUrl.lastIndexOf('/'));
-		
-		// Extract the moduleId from the URL
-		const moduleIdMatch = file.url.match(/modID=(\d+)/i);
-		const moduleId = moduleIdMatch ? moduleIdMatch[1] : '0';
-		
-		const saveUrl = `${basePath}/DesktopModuleEditSave?moduleID=${moduleId}`;
-		const fullSaveUrl = new URL(saveUrl, session.baseUrl).toString();
+		// Construct the save URL
+		const base = file.url ? session.baseUrl + file.url : parentDir?.baseUrl;
+		if (!base) {
+			throw new Error(`Cannot determine base url for saving file: "${fileName}"`);
+		}
+		//		editPageUrl = new URL('HtmlModuleEdit', baseUrlPath).toString();;
+		// /TDAdmin/71907D89-441A-48BE-9CD6-A59A2C5EA305/277/DesktopTemplates/DesktopModuleEditSave?moduleID=0
+		const saveUrl = new URL('DesktopModuleEditSave', base);
+		saveUrl.searchParams.append('moduleID', moduleId);
+		const saveUrlString = saveUrl.toString();
 
 		// Construct the form data with all fields from the example
 		const formData = new URLSearchParams();
-        //token = 'qf69StR-NyeOfE2411ayF9Csz46ZMkOI9-bkZP6gV-JP6hq05zJJTVmNbnPbOnw26nZB5AyNkSMsE4SPQgLtdntdpzsL3IXOu6yFHb_3E3ee_RMb0';
 		formData.append('__RequestVerificationToken', token);
 		formData.append('IsForNext', getFieldValue('IsForNext') || 'False');
 		formData.append('IsForClient', getFieldValue('IsForClient') || 'True');
 		formData.append('ModuleClientPortalApplicationID', getFieldValue('ModuleClientPortalApplicationID') || '');
 		formData.append('ClientPortalCategoryName', getSelectValue('ClientPortalCategoryName') || 'TDClient');
 		formData.append('Name', fileName);
-		formData.append('ShowBorder', 'true');
-		formData.append('ShowBorder', 'false');
-		formData.append('ShowName', 'true');
-		formData.append('ShowName', 'false');
+		formData.append('ShowBorder', getCheckboxValue('ShowBorder') || 'false');
+		formData.append('ShowName', getCheckboxValue('ShowName') || 'false');
 		formData.append('IsSanitized', 'True');
 		formData.append('IsSanitized', 'false');
 		formData.append('CKEContent.Content', htmlContent);
@@ -238,13 +296,13 @@ export class TdxFS implements vscode.FileSystemProvider {
 
 		const formBody = formData.toString();
 
-		const saveResponse = await this.fetchWithCookieJar(fullSaveUrl, {
+		const saveResponse = await this.fetchWithCookieJar(saveUrl.toString(), {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/x-www-form-urlencoded',
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
 				'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-				'Referer': new URL(file.url, session.baseUrl).toString(),
+				'Referer': fullUrl,
 				'Origin': new URL(session.baseUrl).origin,
 				'X-Requested-With': 'XMLHttpRequest',
 				'Sec-Fetch-Dest': 'empty',
@@ -260,16 +318,22 @@ export class TdxFS implements vscode.FileSystemProvider {
 		}
 	}
 
-	setHtmlModules(modules: Array<{ name: string; url: string }>): void {
+	setHtmlModules(modules: Array<{ name: string; url: string }>, htmlModulesPageUrl?: string): void {
 		this.root.entries.clear();
 		const fileChangeEvents: vscode.FileChangeEvent[] = [];
 
+		// Create the "HTML Modules" subdirectory with the base URL stored as metadata
+		const htmlModulesDir = new Directory('HTML Modules', htmlModulesPageUrl);
+		this.root.entries.set('HTML Modules', htmlModulesDir);
+		fileChangeEvents.push({ type: vscode.FileChangeType.Created, uri: vscode.Uri.from({ scheme: 'tdx', path: '/HTML Modules' }) });
+
+		// Populate the HTML Modules directory with module files
 		for (const module of modules) {
 			const file = new File(module.name, module.url);
-			this.root.entries.set(module.name, file);
+			htmlModulesDir.entries.set(module.name, file);
 			
 			// Create a file change event for this file
-			const fileUri = vscode.Uri.from({ scheme: 'tdx', path: `/${module.name}` });
+			const fileUri = vscode.Uri.from({ scheme: 'tdx', path: `/HTML Modules/${encodeURIComponent(module.name)}` });
 			fileChangeEvents.push({ type: vscode.FileChangeType.Created, uri: fileUri });
 		}
 		
@@ -289,6 +353,18 @@ export class TdxFS implements vscode.FileSystemProvider {
 
 	readDirectory(uri: vscode.Uri): [string, vscode.FileType][] {
 		const entry = this._lookupAsDirectory(uri, false);
+		
+		// When reading the root directory, trigger a background refresh of modules
+		if (uri.path === '/' && this.moduleRefreshCallback) {
+			void this.moduleRefreshCallback()
+				.then((result) => {
+					this.setHtmlModules(result.modules, result.htmlModulesPageUrl);
+				})
+				.catch((error) => {
+					console.error(`[TdxFS] Failed to refresh modules in readDirectory: ${error}`);
+				});
+		}
+		
 		const result: [string, vscode.FileType][] = [];
 		for (const [name, child] of entry.entries) {
 			result.push([name, child.type]);

@@ -24,8 +24,21 @@
         "title": "TeamDynamix: Clear Session"
       },
       {
+        "command": "tdx-fs.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "tdx-fs.helloWorld",
         "title": "Hello World"
+      }
+    ],
+    "menus": {},
+    "keybindings": [
+      {
+        "command": "tdx-fs.refresh",
+        "key": "ctrl+shift+r",
+        "when": "explorerViewletFocus"
       }
     ]
   },

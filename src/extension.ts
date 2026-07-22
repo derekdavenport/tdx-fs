@@ -20,6 +20,27 @@ export function activate(context: vscode.ExtensionContext) {
 	const tdxFs = new TdxFS();
 	context.subscriptions.push(vscode.workspace.registerFileSystemProvider('tdx', tdxFs, { isCaseSensitive: true }));
 
+	// Set up the module refresh callback that readDirectory can use
+	tdxFs.setModuleRefreshCallback(async () => {
+		const cookieHeader = await context.secrets.get(SESSION_COOKIE_SECRET_KEY);
+		const baseUrl = context.globalState.get<string>(BASE_URL_KEY);
+		
+		if (!cookieHeader || !baseUrl) {
+			return { modules: [], htmlModulesPageUrl: '' };
+		}
+
+		try {
+			const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader);
+			const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader);
+			const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl);
+			// Return both modules and the htmlModulesPageUrl
+			return { modules, htmlModulesPageUrl };
+		} catch (error) {
+			console.error(`[Extension] Module refresh callback failed: ${error}`);
+			return { modules: [], htmlModulesPageUrl: '' };
+		}
+	});
+
 	// Restore session and defer workspace opening to after activation completes
 	void restoreSession(context, tdxFs).then(() => {
 		// After restoreSession completes, defer opening the workspace
@@ -44,6 +65,32 @@ export function activate(context: vscode.ExtensionContext) {
 		tdxFs.setSession(undefined);
 		tdxFs.setHtmlModules([]);
 		vscode.window.showInformationMessage('Cleared TeamDynamix session cookie.');
+	}));
+
+	context.subscriptions.push(vscode.commands.registerCommand('tdx-fs.refresh', async () => {
+		const cookieHeader = await context.secrets.get(SESSION_COOKIE_SECRET_KEY);
+		const baseUrl = context.globalState.get<string>(BASE_URL_KEY);
+		
+		if (!cookieHeader || !baseUrl) {
+			vscode.window.showInformationMessage('No active TeamDynamix session. Run "TeamDynamix: Initialize Session" first.');
+			return;
+		}
+
+		await vscode.window.withProgress(
+			{ location: vscode.ProgressLocation.Notification, title: 'Refreshing HTML Modules...' },
+			async () => {
+				try {
+					const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader);
+					const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader);
+					const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl);
+					tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
+					vscode.window.showInformationMessage(`Refreshed ${modules.length} HTML Modules.`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					vscode.window.showErrorMessage(`Failed to refresh modules: ${message}`);
+				}
+			}
+		);
 	}));
 
 	context.subscriptions.push(vscode.commands.registerCommand('tdx-fs.openWorkspace', async () => {
@@ -163,7 +210,7 @@ async function loginWithPlaywright(context: vscode.ExtensionContext, tdxFs: TdxF
 				const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader);
 				const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader);
 				const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl);
-				tdxFs.setHtmlModules(modules);
+				tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
 				return modules.length;
 			}
 		);
@@ -373,7 +420,7 @@ async function restoreSession(context: vscode.ExtensionContext, tdxFs: TdxFS): P
 		const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader);
 		const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader);
 		const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl);
-		tdxFs.setHtmlModules(modules);
+		tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(`[Extension] Failed to restore HTML Modules on startup: ${message}`);
