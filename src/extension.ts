@@ -30,9 +30,9 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 
 		try {
-			const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader);
-			const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader);
-			const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl);
+			const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader, context, tdxFs);
+			const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl);
+			const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
 			// Return both modules and the htmlModulesPageUrl
 			return { modules, htmlModulesPageUrl };
 		} catch (error) {
@@ -80,9 +80,9 @@ export function activate(context: vscode.ExtensionContext) {
 			{ location: vscode.ProgressLocation.Notification, title: 'Refreshing HTML Modules...' },
 			async () => {
 				try {
-					const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader);
-					const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader);
-					const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl);
+					const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader, context, tdxFs);
+					const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl);
+					const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
 					tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
 					vscode.window.showInformationMessage(`Refreshed ${modules.length} HTML Modules.`);
 				} catch (error) {
@@ -207,9 +207,9 @@ async function loginWithPlaywright(context: vscode.ExtensionContext, tdxFs: TdxF
 		const progress = await vscode.window.withProgress(
 			{ location: vscode.ProgressLocation.Window, title: 'Loading HTML Modules from TeamDynamix...' },
 			async () => {
-				const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader);
-				const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader);
-				const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl);
+				const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader, context, tdxFs);
+				const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl);
+				const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
 				tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
 				return modules.length;
 			}
@@ -417,9 +417,9 @@ async function restoreSession(context: vscode.ExtensionContext, tdxFs: TdxFS): P
 
 	// Restore HTML modules on startup
 	try {
-		const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader);
-		const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader);
-		const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl);
+		const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader, context, tdxFs);
+		const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl);
+		const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
 		tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -432,18 +432,65 @@ export interface HtmlModule {
 	url: string;
 }
 
+class SessionExpiredError extends Error {
+	constructor() {
+		super('Session expired - redirected to login');
+		this.name = 'SessionExpiredError';
+	}
+}
+
 async function fetchPageWithCookies(url: string, cookieHeader: string): Promise<string> {
 	const response = await fetch(url, {
 		headers: {
 			'Cookie': cookieHeader
-		}
+		},
+		redirect: 'manual'  // Don't follow redirects automatically
 	});
+
+	// Check for redirect to login page
+	if (response.status === 302 || response.status === 301 || response.status === 307 || response.status === 303) {
+		const location = response.headers.get('Location') || '';
+		if (location.startsWith('/TDAdmin/Login') || location.startsWith('/TDClient/Login')) {
+			throw new SessionExpiredError();
+		}
+		// For other redirects, treat as error
+		throw new Error(`Unexpected redirect to: ${location}`);
+	}
 
 	if (!response.ok) {
 		throw new Error(`Failed to fetch ${url}: ${response.statusText}`);
 	}
 
 	return response.text();
+}
+
+async function fetchPageWithRetry(
+	url: string,
+	cookieHeader: string,
+	context: vscode.ExtensionContext,
+	tdxFs: TdxFS,
+	baseUrl: string
+): Promise<string> {
+	try {
+		return await fetchPageWithCookies(url, cookieHeader);
+	} catch (error) {
+		if (error instanceof SessionExpiredError) {
+			vscode.window.showInformationMessage('TeamDynamix session expired. Re-authenticating...');
+			
+			// Re-login to get new cookies
+			await loginWithPlaywright(context, tdxFs);
+			
+			// Get the new cookie header
+			const newCookieHeader = await context.secrets.get(SESSION_COOKIE_SECRET_KEY);
+			if (!newCookieHeader) {
+				throw new Error('Failed to refresh session');
+			}
+			
+			// Retry the request with new cookies
+			return await fetchPageWithCookies(url, newCookieHeader);
+		}
+		throw error;
+	}
 }
 
 function extractLinkFromHtml(html: string, linkText: string): string | undefined {
@@ -453,9 +500,16 @@ function extractLinkFromHtml(html: string, linkText: string): string | undefined
 	return match ? match[1] : undefined;
 }
 
-async function getClientPortalUrl(baseUrl: string, cookieHeader: string): Promise<string> {
+async function getClientPortalUrl(
+	baseUrl: string,
+	cookieHeader: string,
+	context?: vscode.ExtensionContext,
+	tdxFs?: TdxFS
+): Promise<string> {
 	const appInstancesUrl = `${baseUrl}/TDAdmin/BE/AppInstances/`;
-	const html = await fetchPageWithCookies(appInstancesUrl, cookieHeader);
+	const html = context && tdxFs
+		? await fetchPageWithRetry(appInstancesUrl, cookieHeader, context, tdxFs, baseUrl)
+		: await fetchPageWithCookies(appInstancesUrl, cookieHeader);
 
 	// Find the grdAppInstances table and extract the Client Portal link
 	const tableMatch = html.match(/<table[^>]*id="grdAppInstances"[^>]*>[\s\S]*?<\/table>/i);
@@ -475,8 +529,16 @@ async function getClientPortalUrl(baseUrl: string, cookieHeader: string): Promis
 	return url.toString();
 }
 
-async function getHtmlModulesPageUrl(clientPortalUrl: string, cookieHeader: string): Promise<string> {
-	const html = await fetchPageWithCookies(clientPortalUrl, cookieHeader);
+async function getHtmlModulesPageUrl(
+	clientPortalUrl: string,
+	cookieHeader: string,
+	context?: vscode.ExtensionContext,
+	tdxFs?: TdxFS,
+	baseUrl?: string
+): Promise<string> {
+	const html = context && tdxFs && baseUrl
+		? await fetchPageWithRetry(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl)
+		: await fetchPageWithCookies(clientPortalUrl, cookieHeader);
 
 	const htmlModulesLink = extractLinkFromHtml(html, 'HTML Modules');
 	if (!htmlModulesLink) {
@@ -548,7 +610,13 @@ function parseGridItems(html: string): HtmlModule[] {
 	return modules;
 }
 
-async function getAllHtmlModules(htmlModulesPageUrl: string, cookieHeader: string, baseUrl: string): Promise<HtmlModule[]> {
+async function getAllHtmlModules(
+	htmlModulesPageUrl: string,
+	cookieHeader: string,
+	baseUrl: string,
+	context?: vscode.ExtensionContext,
+	tdxFs?: TdxFS
+): Promise<HtmlModule[]> {
 	const allModules: HtmlModule[] = [];
 	let pageNumber = 1;
 	const maxPages = 100; // Safety limit to prevent infinite loops
@@ -562,7 +630,9 @@ async function getAllHtmlModules(htmlModulesPageUrl: string, cookieHeader: strin
 		}
 
 		try {
-			const html = await fetchPageWithCookies(pageUrl, cookieHeader);
+			const html = context && tdxFs
+				? await fetchPageWithRetry(pageUrl, cookieHeader, context, tdxFs, baseUrl)
+				: await fetchPageWithCookies(pageUrl, cookieHeader);
 			const modules = parseGridItems(html);
 
 			if (modules.length === 0) {
