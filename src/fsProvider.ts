@@ -58,6 +58,21 @@ export class Directory implements vscode.FileStat {
 
 export type Entry = File | Directory;
 
+/**
+ * Sanitize filenames by replacing problematic characters with safe alternatives.
+ * Slashes are replaced with "／" to preserve readability while avoiding path ambiguity.
+ */
+function sanitizeFileName(name: string): string {
+	return name.replace(/\//g, '／');
+}
+
+/**
+ * Unsanitize filenames by reversing the sanitization.
+ */
+function unsanitizeFileName(name: string): string {
+	return name.replace(/／/g, '/');
+}
+
 export class TdxFS implements vscode.FileSystemProvider {
 
 	root = new Directory('');
@@ -121,12 +136,14 @@ export class TdxFS implements vscode.FileSystemProvider {
 		
 		const htmlModulesDir = this.root.entries.get('HTML Modules');
 		if (htmlModulesDir && htmlModulesDir instanceof Directory) {
-			file = htmlModulesDir.entries.get(fileName) as File;
+			const sanitizedName = sanitizeFileName(fileName);
+			file = htmlModulesDir.entries.get(sanitizedName) as File;
 		}
 		
 		// Fallback check in root for compatibility
 		if (!file) {
-			const entry = this.root.entries.get(fileName);
+			const sanitizedName = sanitizeFileName(fileName);
+			const entry = this.root.entries.get(sanitizedName);
 			if (entry && entry instanceof File) {
 				file = entry;
 			}
@@ -151,12 +168,19 @@ export class TdxFS implements vscode.FileSystemProvider {
 		const html = await response.text();
 
 		// Extract the HTML content from the textarea with id="CKEContent_Content"
-		const textareaMatch = html.match(/<textarea[^>]*id="CKEContent_Content"[^>]*>([\s\S]*?)<\/textarea>/i);
-		if (!textareaMatch) {
-			throw new Error(`Could not find CKEContent_Content textarea for ${fileName}`);
+		let contentMatch = html.match(/<textarea[^>]*id="CKEContent_Content"[^>]*>([\s\S]*?)<\/textarea>/i);
+		if (!contentMatch) {
+			contentMatch = html.match(/<div[^>]*class="well code"[^>]*>([\s\S]*?)<\/div>/i);
+			// If that's not there, 
+			if (!contentMatch) {
+				throw new Error(`Could not find HTML content in the fetched page for file: ${fileName}`);
+			}
+			contentMatch[1] = contentMatch[1].trim().replace(/<br\s*\/?>/gi, '\n');
+			// @todo: mark read only
+
 		}
 
-		const escapedContent = textareaMatch[1];
+		const escapedContent = contentMatch[1];
 
 		// Unescape HTML entities - do &amp; last to avoid double-unescaping
 		const unescaped = escapedContent
@@ -186,7 +210,8 @@ export class TdxFS implements vscode.FileSystemProvider {
 		
 		const htmlModulesDir = this.root.entries.get('HTML Modules');
 		if (htmlModulesDir && htmlModulesDir instanceof Directory) {
-			file = htmlModulesDir.entries.get(fileName) as File;
+			const sanitizedName = sanitizeFileName(fileName);
+			file = htmlModulesDir.entries.get(sanitizedName) as File;
 			if (file) {
 				parentDir = htmlModulesDir;
 			}
@@ -194,7 +219,8 @@ export class TdxFS implements vscode.FileSystemProvider {
 		
 		// Fallback check in root for compatibility
 		if (!file) {
-			const entry = this.root.entries.get(fileName);
+			const sanitizedName = sanitizeFileName(fileName);
+			const entry = this.root.entries.get(sanitizedName);
 			if (entry && entry instanceof File) {
 				file = entry;
 				parentDir = this.root;
@@ -286,7 +312,7 @@ export class TdxFS implements vscode.FileSystemProvider {
 		formData.append('IsForClient', getFieldValue('IsForClient') || 'True');
 		formData.append('ModuleClientPortalApplicationID', getFieldValue('ModuleClientPortalApplicationID') || '');
 		formData.append('ClientPortalCategoryName', getSelectValue('ClientPortalCategoryName') || 'TDClient');
-		formData.append('Name', fileName);
+		formData.append('Name', file.name);  // Use the original module name, not the sanitized one
 		formData.append('ShowBorder', getCheckboxValue('ShowBorder') || 'false');
 		formData.append('ShowName', getCheckboxValue('ShowName') || 'false');
 		formData.append('IsSanitized', 'True');
@@ -329,11 +355,12 @@ export class TdxFS implements vscode.FileSystemProvider {
 
 		// Populate the HTML Modules directory with module files
 		for (const module of modules) {
+			const sanitizedName = sanitizeFileName(module.name);
 			const file = new File(module.name, module.url);
-			htmlModulesDir.entries.set(module.name, file);
+			htmlModulesDir.entries.set(sanitizedName, file);
 			
 			// Create a file change event for this file
-			const fileUri = vscode.Uri.from({ scheme: 'tdx', path: `/HTML Modules/${encodeURIComponent(module.name)}` });
+			const fileUri = vscode.Uri.from({ scheme: 'tdx', path: `/HTML Modules/${encodeURIComponent(sanitizedName)}` });
 			fileChangeEvents.push({ type: vscode.FileChangeType.Created, uri: fileUri });
 		}
 		
