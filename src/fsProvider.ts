@@ -75,9 +75,13 @@ function unsanitizeFileName(name: string): string {
 
 export class TdxFS implements vscode.FileSystemProvider {
 
-	root = new Directory('');
+	root = new Directory('Apps');
 	private session?: TdxSession;
 	private moduleRefreshCallback?: () => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>;
+	private appRefreshCallback?: (appName: string) => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>;
+	private refreshTimestamps = new Map<string, number>();
+	private refreshDebounceMs = 5 * 1000; // 5 seconds
+	private isRefreshing = new Map<string, boolean>();
 
 	setSession(session: TdxSession | undefined): void {
 		this.session = session;
@@ -89,6 +93,10 @@ export class TdxFS implements vscode.FileSystemProvider {
 
 	setModuleRefreshCallback(callback: () => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>): void {
 		this.moduleRefreshCallback = callback;
+	}
+
+	setAppRefreshCallback(callback: (appName: string) => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>): void {
+		this.appRefreshCallback = callback;
 	}
 
 	private async fetchWithCookieJar(url: string, options?: RequestInit): Promise<Response> {
@@ -131,15 +139,57 @@ export class TdxFS implements vscode.FileSystemProvider {
 			throw new Error('No active TeamDynamix session');
 		}
 
-		// Find the file - first check in HTML Modules directory
+		// Find the file - search in nested structure
 		let file: File | undefined;
 		
-		const htmlModulesDir = this.root.entries.get('HTML Modules');
-		if (htmlModulesDir && htmlModulesDir instanceof Directory) {
-			const sanitizedName = sanitizeFileName(fileName);
-			file = htmlModulesDir.entries.get(sanitizedName) as File;
+		// Check Client Portal Apps
+		const clientPortalAppsDir = this.root.entries.get('Client Portal Apps');
+		if (clientPortalAppsDir && clientPortalAppsDir instanceof Directory) {
+			for (const appEntry of clientPortalAppsDir.entries.values()) {
+				if (appEntry instanceof Directory) {
+					const htmlModulesDir = appEntry.entries.get('HTML Modules');
+					if (htmlModulesDir && htmlModulesDir instanceof Directory) {
+						const sanitizedName = sanitizeFileName(fileName);
+						const foundFile = htmlModulesDir.entries.get(sanitizedName) as File;
+						if (foundFile) {
+							file = foundFile;
+							break;
+						}
+					}
+				}
+			}
 		}
-		
+
+		// Check Ticketing Apps
+		if (!file) {
+			const ticketingAppsDir = this.root.entries.get('Ticketing Apps');
+			if (ticketingAppsDir && ticketingAppsDir instanceof Directory) {
+				for (const appEntry of ticketingAppsDir.entries.values()) {
+					if (appEntry instanceof Directory) {
+						// Check Notification Templates
+						const notificationTemplatesDir = appEntry.entries.get('Notification Templates');
+						if (notificationTemplatesDir && notificationTemplatesDir instanceof Directory) {
+							const sanitizedName = sanitizeFileName(fileName);
+							const foundFile = notificationTemplatesDir.entries.get(sanitizedName) as File;
+							if (foundFile) {
+								file = foundFile;
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Fallback check in root level HTML Modules for compatibility
+		if (!file) {
+			const htmlModulesDir = this.root.entries.get('HTML Modules');
+			if (htmlModulesDir && htmlModulesDir instanceof Directory) {
+				const sanitizedName = sanitizeFileName(fileName);
+				file = htmlModulesDir.entries.get(sanitizedName) as File;
+			}
+		}
+
 		// Fallback check in root for compatibility
 		if (!file) {
 			const sanitizedName = sanitizeFileName(fileName);
@@ -204,16 +254,60 @@ export class TdxFS implements vscode.FileSystemProvider {
 			throw new Error('No active TeamDynamix session');
 		}
 
-		// Find the file - first check in HTML Modules directory
+		// Find the file - search in nested structure
 		let file: File | undefined;
 		let parentDir: Directory | undefined;
 		
-		const htmlModulesDir = this.root.entries.get('HTML Modules');
-		if (htmlModulesDir && htmlModulesDir instanceof Directory) {
-			const sanitizedName = sanitizeFileName(fileName);
-			file = htmlModulesDir.entries.get(sanitizedName) as File;
-			if (file) {
-				parentDir = htmlModulesDir;
+		// Check Client Portal Apps
+		const clientPortalAppsDir = this.root.entries.get('Client Portal Apps');
+		if (clientPortalAppsDir && clientPortalAppsDir instanceof Directory) {
+			for (const appEntry of clientPortalAppsDir.entries.values()) {
+				if (appEntry instanceof Directory) {
+					const htmlModulesDir = appEntry.entries.get('HTML Modules');
+					if (htmlModulesDir && htmlModulesDir instanceof Directory) {
+						const sanitizedName = sanitizeFileName(fileName);
+						const foundFile = htmlModulesDir.entries.get(sanitizedName) as File;
+						if (foundFile) {
+							file = foundFile;
+							parentDir = htmlModulesDir;
+							break;
+						}
+					}
+				}
+			}
+		}
+
+		// Check Ticketing Apps
+		if (!file) {
+			const ticketingAppsDir = this.root.entries.get('Ticketing Apps');
+			if (ticketingAppsDir && ticketingAppsDir instanceof Directory) {
+				for (const appEntry of ticketingAppsDir.entries.values()) {
+					if (appEntry instanceof Directory) {
+						// Check Notification Templates
+						const notificationTemplatesDir = appEntry.entries.get('Notification Templates');
+						if (notificationTemplatesDir && notificationTemplatesDir instanceof Directory) {
+							const sanitizedName = sanitizeFileName(fileName);
+							const foundFile = notificationTemplatesDir.entries.get(sanitizedName) as File;
+							if (foundFile) {
+								file = foundFile;
+								parentDir = notificationTemplatesDir;
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Fallback check in root level HTML Modules for compatibility
+		if (!file) {
+			const htmlModulesDir = this.root.entries.get('HTML Modules');
+			if (htmlModulesDir && htmlModulesDir instanceof Directory) {
+				const sanitizedName = sanitizeFileName(fileName);
+				file = htmlModulesDir.entries.get(sanitizedName) as File;
+				if (file) {
+					parentDir = htmlModulesDir;
+				}
 			}
 		}
 		
@@ -344,31 +438,82 @@ export class TdxFS implements vscode.FileSystemProvider {
 		}
 	}
 
-	setHtmlModules(modules: Array<{ name: string; url: string }>, htmlModulesPageUrl?: string): void {
-		this.root.entries.clear();
-		const fileChangeEvents: vscode.FileChangeEvent[] = [];
-
-		// Create the "HTML Modules" subdirectory with the base URL stored as metadata
-		const htmlModulesDir = new Directory('HTML Modules', htmlModulesPageUrl);
-		this.root.entries.set('HTML Modules', htmlModulesDir);
-		fileChangeEvents.push({ type: vscode.FileChangeType.Created, uri: vscode.Uri.from({ scheme: 'tdx', path: '/HTML Modules' }) });
-
-		// Populate the HTML Modules directory with module files
-		for (const module of modules) {
-			const sanitizedName = sanitizeFileName(module.name);
-			const file = new File(module.name, module.url);
-			htmlModulesDir.entries.set(sanitizedName, file);
-			
-			// Create a file change event for this file
-			const fileUri = vscode.Uri.from({ scheme: 'tdx', path: `/HTML Modules/${encodeURIComponent(sanitizedName)}` });
-			fileChangeEvents.push({ type: vscode.FileChangeType.Created, uri: fileUri });
+	setClientPortalApps(apps: Array<{ appName: string; htmlModulesPageUrl?: string; modules: Array<{ name: string; url: string }> }>): void {
+		// Create or get the "Client Portal Apps" directory
+		let clientPortalAppsDir = this.root.entries.get('Client Portal Apps') as Directory | undefined;
+		if (!clientPortalAppsDir) {
+			clientPortalAppsDir = new Directory('Client Portal Apps');
+			this.root.entries.set('Client Portal Apps', clientPortalAppsDir);
 		}
-		
-		// Emit change event for the root directory itself
-		const rootUri = vscode.Uri.from({ scheme: 'tdx', path: '/' });
-		fileChangeEvents.push({ type: vscode.FileChangeType.Changed, uri: rootUri });
-		
-		this._fireSoon(...fileChangeEvents);
+
+		// Clear existing apps
+		clientPortalAppsDir.entries.clear();
+
+		// Populate each Client Portal app
+		for (const app of apps) {
+			const sanitizedAppName = sanitizeFileName(app.appName);
+			const appDir = new Directory(app.appName);
+			clientPortalAppsDir.entries.set(sanitizedAppName, appDir);
+
+			// Create HTML Modules subdirectory
+			const htmlModulesDir = new Directory('HTML Modules', app.htmlModulesPageUrl);
+			appDir.entries.set('HTML Modules', htmlModulesDir);
+
+			// Populate HTML Modules
+			for (const module of app.modules) {
+				const sanitizedModuleName = sanitizeFileName(module.name);
+				const file = new File(module.name, module.url);
+				htmlModulesDir.entries.set(sanitizedModuleName, file);
+			}
+		}
+	}
+
+	setClientPortalApp(app: { appName: string; htmlModulesPageUrl?: string; modules: Array<{ name: string; url: string }> }): void {
+		// Create or get the "Client Portal Apps" directory
+		let clientPortalAppsDir = this.root.entries.get('Client Portal Apps') as Directory | undefined;
+		if (!clientPortalAppsDir) {
+			clientPortalAppsDir = new Directory('Client Portal Apps');
+			this.root.entries.set('Client Portal Apps', clientPortalAppsDir);
+		}
+
+		// Update only this specific app (preserves other apps)
+		const sanitizedAppName = sanitizeFileName(app.appName);
+		const appDir = new Directory(app.appName);
+		clientPortalAppsDir.entries.set(sanitizedAppName, appDir);
+
+		// Create HTML Modules subdirectory
+		const htmlModulesDir = new Directory('HTML Modules', app.htmlModulesPageUrl);
+		appDir.entries.set('HTML Modules', htmlModulesDir);
+
+		// Populate HTML Modules
+		for (const module of app.modules) {
+			const sanitizedModuleName = sanitizeFileName(module.name);
+			const file = new File(module.name, module.url);
+			htmlModulesDir.entries.set(sanitizedModuleName, file);
+		}
+	}
+
+	setTicketingApps(apps: Array<{ appName: string }>): void {
+		// Create or get the "Ticketing Apps" directory
+		let ticketingAppsDir = this.root.entries.get('Ticketing Apps') as Directory | undefined;
+		if (!ticketingAppsDir) {
+			ticketingAppsDir = new Directory('Ticketing Apps');
+			this.root.entries.set('Ticketing Apps', ticketingAppsDir);
+		}
+
+		// Clear existing apps
+		ticketingAppsDir.entries.clear();
+
+		// Populate each Ticketing app
+		for (const app of apps) {
+			const sanitizedAppName = sanitizeFileName(app.appName);
+			const appDir = new Directory(app.appName);
+			ticketingAppsDir.entries.set(sanitizedAppName, appDir);
+
+			// Create Notification Templates subdirectory (placeholder for now)
+			const notificationTemplatesDir = new Directory('Notification Templates');
+			appDir.entries.set('Notification Templates', notificationTemplatesDir);
+		}
 	}
 
 	// --- manage file metadata
@@ -381,15 +526,17 @@ export class TdxFS implements vscode.FileSystemProvider {
 	readDirectory(uri: vscode.Uri): [string, vscode.FileType][] {
 		const entry = this._lookupAsDirectory(uri, false);
 		
-		// When reading the root directory, trigger a background refresh of modules
-		if (uri.path === '/' && this.moduleRefreshCallback) {
-			void this.moduleRefreshCallback()
-				.then((result) => {
-					this.setHtmlModules(result.modules, result.htmlModulesPageUrl);
-				})
-				.catch((error) => {
-					console.error(`[TdxFS] Failed to refresh modules in readDirectory: ${error}`);
-				});
+		// Determine if this is a root read or app-specific read, and trigger appropriate refresh
+		if (uri.path === '/') {
+			// Root read: refresh app lists
+			this._triggerRefreshIfNeeded('root', this.moduleRefreshCallback);
+		} else {
+			// Check if this is an app folder read (e.g., /Client Portal Apps/[AppName])
+			const appMatch = uri.path.match(/^\/(Client Portal Apps|Ticketing Apps)\/([^\/]+)$/);
+			if (appMatch && this.appRefreshCallback) {
+				const appName = decodeURIComponent(appMatch[2]);
+				this._triggerRefreshIfNeeded(`app:${appName}`, () => this.appRefreshCallback!(appName));
+			}
 		}
 		
 		const result: [string, vscode.FileType][] = [];
@@ -397,6 +544,27 @@ export class TdxFS implements vscode.FileSystemProvider {
 			result.push([name, child.type]);
 		}
 		return result;
+	}
+
+	private _triggerRefreshIfNeeded(path: string, callback?: () => Promise<any>): void {
+		if (!callback) return;
+		
+		const now = Date.now();
+		const lastRefresh = this.refreshTimestamps.get(path) ?? 0;
+		const isRefreshing = this.isRefreshing.get(path) ?? false;
+		
+		if (now - lastRefresh >= this.refreshDebounceMs && !isRefreshing) {
+			this.refreshTimestamps.set(path, now);
+			this.isRefreshing.set(path, true);
+			
+			void callback()
+				.catch((error) => {
+					console.error(`[TdxFS] Failed to refresh ${path}: ${error}`);
+				})
+				.finally(() => {
+					this.isRefreshing.set(path, false);
+				});
+		}
 	}
 
 	// --- manage file contents

@@ -20,7 +20,7 @@ export function activate(context: vscode.ExtensionContext) {
 	const tdxFs = new TdxFS();
 	context.subscriptions.push(vscode.workspace.registerFileSystemProvider('tdx', tdxFs, { isCaseSensitive: true }));
 
-	// Set up the module refresh callback that readDirectory can use
+	// Set up module refresh callback (triggered when root directory is read)
 	tdxFs.setModuleRefreshCallback(async () => {
 		const cookieHeader = await context.secrets.get(SESSION_COOKIE_SECRET_KEY);
 		const baseUrl = context.globalState.get<string>(BASE_URL_KEY);
@@ -30,18 +30,65 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 
 		try {
-			const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader, context, tdxFs);
-			const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl);
-			const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
-			// Return both modules and the htmlModulesPageUrl
-			return { modules, htmlModulesPageUrl };
+			// Load all Client Portal Apps and their HTML Modules
+			const clientPortalApps = await getClientPortalApps(baseUrl, cookieHeader, context, tdxFs);
+			const clientPortalAppsData = await Promise.all(clientPortalApps.map(async (app) => {
+				try {
+					const appUrl = new URL(app.appUrl, baseUrl).toString();
+					const htmlModulesPageUrl = await getHtmlModulesPageUrl(appUrl, cookieHeader, context, tdxFs, baseUrl);
+					const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
+					return { appName: app.appName, htmlModulesPageUrl, modules };
+				} catch (error) {
+					console.error(`[Extension] Failed to load HTML Modules for app "${app.appName}": ${error}`);
+					return { appName: app.appName, htmlModulesPageUrl: '', modules: [] };
+				}
+			}));
+			tdxFs.setClientPortalApps(clientPortalAppsData);
+
+			// Load all Ticketing Apps (placeholder for now)
+			const ticketingApps = await getTicketingApps(baseUrl, cookieHeader, context, tdxFs);
+			const ticketingAppsData = ticketingApps.map(app => ({ appName: app.appName }));
+			tdxFs.setTicketingApps(ticketingAppsData);
+
+			return { modules: [], htmlModulesPageUrl: '' };
 		} catch (error) {
 			console.error(`[Extension] Module refresh callback failed: ${error}`);
 			return { modules: [], htmlModulesPageUrl: '' };
 		}
 	});
 
-	// Restore session and defer workspace opening to after activation completes
+	// Set up app refresh callback (triggered when an app folder is read)
+	tdxFs.setAppRefreshCallback(async (appName: string) => {
+		const cookieHeader = await context.secrets.get(SESSION_COOKIE_SECRET_KEY);
+		const baseUrl = context.globalState.get<string>(BASE_URL_KEY);
+		
+		if (!cookieHeader || !baseUrl) {
+			return { modules: [], htmlModulesPageUrl: '' };
+		}
+
+		try {
+			// Find the specific app and reload its modules
+			const clientPortalApps = await getClientPortalApps(baseUrl, cookieHeader, context, tdxFs);
+			const targetApp = clientPortalApps.find(app => app.appName === appName);
+			
+			if (!targetApp) {
+				console.warn(`[Extension] App not found: ${appName}`);
+				return { modules: [], htmlModulesPageUrl: '' };
+			}
+
+			const appUrl = new URL(targetApp.appUrl, baseUrl).toString();
+			const htmlModulesPageUrl = await getHtmlModulesPageUrl(appUrl, cookieHeader, context, tdxFs, baseUrl);
+			const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
+			
+			// Update just this app in the file system (preserves other apps)
+			tdxFs.setClientPortalApp({ appName: targetApp.appName, htmlModulesPageUrl, modules });
+			
+			return { modules, htmlModulesPageUrl };
+		} catch (error) {
+			console.error(`[Extension] App refresh callback failed for ${appName}: ${error}`);
+			return { modules: [], htmlModulesPageUrl: '' };
+		}
+	});
 	void restoreSession(context, tdxFs).then(() => {
 		// After restoreSession completes, defer opening the workspace
 		setTimeout(() => {
@@ -63,7 +110,6 @@ export function activate(context: vscode.ExtensionContext) {
 		await context.secrets.delete(SESSION_COOKIE_SECRET_KEY);
 		await context.globalState.update(BASE_URL_KEY, undefined);
 		tdxFs.setSession(undefined);
-		tdxFs.setHtmlModules([]);
 		vscode.window.showInformationMessage('Cleared TeamDynamix session cookie.');
 	}));
 
@@ -77,17 +123,33 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 
 		await vscode.window.withProgress(
-			{ location: vscode.ProgressLocation.Notification, title: 'Refreshing HTML Modules...' },
+			{ location: vscode.ProgressLocation.Notification, title: 'Refreshing Client Portal and Ticketing Apps...' },
 			async () => {
 				try {
-					const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader, context, tdxFs);
-					const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl);
-					const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
-					tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
-					vscode.window.showInformationMessage(`Refreshed ${modules.length} HTML Modules.`);
+					// Load all Client Portal Apps and their HTML Modules
+					const clientPortalApps = await getClientPortalApps(baseUrl, cookieHeader, context, tdxFs);
+					const clientPortalAppsData = await Promise.all(clientPortalApps.map(async (app) => {
+						try {
+							const appUrl = new URL(app.appUrl, baseUrl).toString();
+							const htmlModulesPageUrl = await getHtmlModulesPageUrl(appUrl, cookieHeader, context, tdxFs, baseUrl);
+							const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
+							return { appName: app.appName, htmlModulesPageUrl, modules };
+						} catch (error) {
+							console.error(`[Extension] Failed to load HTML Modules for app "${app.appName}": ${error}`);
+							return { appName: app.appName, htmlModulesPageUrl: '', modules: [] };
+						}
+					}));
+					tdxFs.setClientPortalApps(clientPortalAppsData);
+
+					// Load all Ticketing Apps (placeholder for now)
+					const ticketingApps = await getTicketingApps(baseUrl, cookieHeader, context, tdxFs);
+					const ticketingAppsData = ticketingApps.map(app => ({ appName: app.appName }));
+					tdxFs.setTicketingApps(ticketingAppsData);
+
+					vscode.window.showInformationMessage(`Refreshed ${clientPortalAppsData.length} Client Portal Apps and ${ticketingAppsData.length} Ticketing Apps.`);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
-					vscode.window.showErrorMessage(`Failed to refresh modules: ${message}`);
+					vscode.window.showErrorMessage(`Failed to refresh apps: ${message}`);
 				}
 			}
 		);
@@ -202,28 +264,44 @@ async function loginWithPlaywright(context: vscode.ExtensionContext, tdxFs: TdxF
 	await saveSession(context, tdxFs, baseUrl, cookieHeader);
 	vscode.window.showInformationMessage('TeamDynamix session captured with Playwright and saved.');
 
-	// Load HTML modules and populate the file system
+	// Load Client Portal Apps, Ticketing Apps and their resources
 	try {
 		const progress = await vscode.window.withProgress(
-			{ location: vscode.ProgressLocation.Window, title: 'Loading HTML Modules from TeamDynamix...' },
+			{ location: vscode.ProgressLocation.Window, title: 'Loading TeamDynamix Apps...' },
 			async () => {
-				const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader, context, tdxFs);
-				const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl);
-				const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
-				tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
-				return modules.length;
+				// Load all Client Portal Apps and their HTML Modules
+				const clientPortalApps = await getClientPortalApps(baseUrl, cookieHeader, context, tdxFs);
+				const clientPortalAppsData = await Promise.all(clientPortalApps.map(async (app) => {
+					try {
+						const appUrl = new URL(app.appUrl, baseUrl).toString();
+						const htmlModulesPageUrl = await getHtmlModulesPageUrl(appUrl, cookieHeader, context, tdxFs, baseUrl);
+						const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
+						return { appName: app.appName, htmlModulesPageUrl, modules };
+					} catch (error) {
+						console.error(`[Extension] Failed to load HTML Modules for app "${app.appName}": ${error}`);
+						return { appName: app.appName, htmlModulesPageUrl: '', modules: [] };
+					}
+				}));
+				tdxFs.setClientPortalApps(clientPortalAppsData);
+
+				// Load all Ticketing Apps (placeholder for now)
+				const ticketingApps = await getTicketingApps(baseUrl, cookieHeader, context, tdxFs);
+				const ticketingAppsData = ticketingApps.map(app => ({ appName: app.appName }));
+				tdxFs.setTicketingApps(ticketingAppsData);
+
+				return { clientPortalCount: clientPortalAppsData.length, ticketingCount: ticketingAppsData.length };
 			}
 		);
 
-		vscode.window.showInformationMessage(`Loaded ${progress} HTML Modules from TeamDynamix.`);
+		vscode.window.showInformationMessage(`Loaded ${progress.clientPortalCount} Client Portal Apps and ${progress.ticketingCount} Ticketing Apps.`);
 
 		// Open the tdx workspace to display the files
 		const tdxUri = vscode.Uri.from({ scheme: 'tdx', path: '/' });
 		await vscode.commands.executeCommand('vscode.openFolder', tdxUri);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(`Failed to load HTML Modules: ${message}`);
-		vscode.window.showWarningMessage(`Failed to load HTML Modules: ${message}`);
+		console.error(`Failed to load apps: ${message}`);
+		vscode.window.showWarningMessage(`Failed to load apps: ${message}`);
 	}
 }
 
@@ -415,21 +493,43 @@ async function restoreSession(context: vscode.ExtensionContext, tdxFs: TdxFS): P
 		lastUpdated: Date.now()
 	});
 
-	// Restore HTML modules on startup
+	// Restore Client Portal and Ticketing apps on startup
 	try {
-		const clientPortalUrl = await getClientPortalUrl(baseUrl, cookieHeader, context, tdxFs);
-		const htmlModulesPageUrl = await getHtmlModulesPageUrl(clientPortalUrl, cookieHeader, context, tdxFs, baseUrl);
-		const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
-		tdxFs.setHtmlModules(modules, htmlModulesPageUrl);
+		// Load all Client Portal Apps and their HTML Modules
+		const clientPortalApps = await getClientPortalApps(baseUrl, cookieHeader, context, tdxFs);
+		const clientPortalAppsData = await Promise.all(clientPortalApps.map(async (app) => {
+			try {
+				const appUrl = new URL(app.appUrl, baseUrl).toString();
+				const htmlModulesPageUrl = await getHtmlModulesPageUrl(appUrl, cookieHeader, context, tdxFs, baseUrl);
+				const modules = await getAllHtmlModules(htmlModulesPageUrl, cookieHeader, baseUrl, context, tdxFs);
+				return { appName: app.appName, htmlModulesPageUrl, modules };
+			} catch (error) {
+				console.error(`[Extension] Failed to restore HTML Modules for app "${app.appName}": ${error}`);
+				return { appName: app.appName, htmlModulesPageUrl: '', modules: [] };
+			}
+		}));
+		tdxFs.setClientPortalApps(clientPortalAppsData);
+
+		// Load all Ticketing Apps (placeholder for now)
+		const ticketingApps = await getTicketingApps(baseUrl, cookieHeader, context, tdxFs);
+		const ticketingAppsData = ticketingApps.map(app => ({ appName: app.appName }));
+		tdxFs.setTicketingApps(ticketingAppsData);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(`[Extension] Failed to restore HTML Modules on startup: ${message}`);
+		console.error(`[Extension] Failed to restore apps on startup: ${message}`);
 	}
 }
 
 export interface HtmlModule {
 	name: string;
 	url: string;
+}
+
+export interface AppInstance {
+	appId: string;
+	appName: string;
+	appUrl: string;
+	appType: 'Client Portal App' | 'Ticketing App' | 'Unknown';
 }
 
 class SessionExpiredError extends Error {
@@ -527,6 +627,121 @@ async function getClientPortalUrl(
 	// Resolve relative URLs
 	const url = new URL(clientPortalLink, baseUrl);
 	return url.toString();
+}
+
+/**
+ * Parse AppInstances table to extract app instances by type
+ */
+function parseAppInstances(html: string): AppInstance[] {
+	const apps: AppInstance[] = [];
+
+	// Find the grdAppInstances table
+	const tableMatch = html.match(/<table[^>]*id="grdAppInstances"[^>]*>[\s\S]*?<\/table>/i);
+	if (!tableMatch) {
+		throw new Error('Could not find grdAppInstances table on AppInstances page');
+	}
+
+	const tableHtml = tableMatch[0];
+
+	// Extract all rows from tbody
+	const tbodyMatch = tableHtml.match(/<tbody[^>]*>[\s\S]*?<\/tbody>/i);
+	if (!tbodyMatch) {
+		return apps;
+	}
+
+	const tbodyHtml = tbodyMatch[0];
+
+	// Extract each row
+	const rowRegex = /<tr[^>]*>[\s\S]*?<\/tr>/gi;
+	let rowMatch;
+
+	while ((rowMatch = rowRegex.exec(tbodyHtml)) !== null) {
+		const rowHtml = rowMatch[0];
+
+		// Extract columns (td elements)
+		const columns: string[] = [];
+		const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+		let cellMatch;
+
+		while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+			columns.push(cellMatch[1].trim());
+		}
+
+		if (columns.length < 3) {
+			continue;
+		}
+
+		// Column 0: App ID
+		const appIdText = columns[0].replace(/<[^>]*>/g, '').trim();
+		
+		// Column 1: App name from link
+		const appNameMatch = columns[1].match(/<a[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>/i);
+		if (!appNameMatch) {
+			continue;
+		}
+
+		const appUrl = appNameMatch[1];
+		const appName = appNameMatch[2].trim();
+
+		// Column 2: App type - look for the label text
+		const appTypeMatch = columns[2].match(/(Client Portal App|Ticketing App)/i);
+		let appType: 'Client Portal App' | 'Ticketing App' | 'Unknown' = 'Unknown';
+		if (appTypeMatch) {
+			const typeText = appTypeMatch[1].toLowerCase();
+			if (typeText === 'client portal app') {
+				appType = 'Client Portal App';
+			} else if (typeText === 'ticketing app') {
+				appType = 'Ticketing App';
+			}
+		}
+
+		if (appName && appUrl && appType !== 'Unknown') {
+			apps.push({
+				appId: appIdText,
+				appName,
+				appUrl,
+				appType
+			});
+		}
+	}
+
+	return apps;
+}
+
+/**
+ * Get all Client Portal Apps from the AppInstances page
+ */
+async function getClientPortalApps(
+	baseUrl: string,
+	cookieHeader: string,
+	context?: vscode.ExtensionContext,
+	tdxFs?: TdxFS
+): Promise<AppInstance[]> {
+	const appInstancesUrl = `${baseUrl}/TDAdmin/BE/AppInstances/`;
+	const html = context && tdxFs
+		? await fetchPageWithRetry(appInstancesUrl, cookieHeader, context, tdxFs, baseUrl)
+		: await fetchPageWithCookies(appInstancesUrl, cookieHeader);
+
+	const apps = parseAppInstances(html);
+	return apps.filter(app => app.appType === 'Client Portal App');
+}
+
+/**
+ * Get all Ticketing Apps from the AppInstances page
+ */
+async function getTicketingApps(
+	baseUrl: string,
+	cookieHeader: string,
+	context?: vscode.ExtensionContext,
+	tdxFs?: TdxFS
+): Promise<AppInstance[]> {
+	const appInstancesUrl = `${baseUrl}/TDAdmin/BE/AppInstances/`;
+	const html = context && tdxFs
+		? await fetchPageWithRetry(appInstancesUrl, cookieHeader, context, tdxFs, baseUrl)
+		: await fetchPageWithCookies(appInstancesUrl, cookieHeader);
+
+	const apps = parseAppInstances(html);
+	return apps.filter(app => app.appType === 'Ticketing App');
 }
 
 async function getHtmlModulesPageUrl(
