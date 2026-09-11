@@ -1,4 +1,4 @@
-const esbuild = require("esbuild");
+import esbuild from "esbuild";
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -29,7 +29,7 @@ async function main() {
 			'src/extension.ts'
 		],
 		bundle: true,
-		format: 'cjs',
+		format: 'esm',
 		minify: production,
 		sourcemap: !production,
 		sourcesContent: false,
@@ -41,6 +41,9 @@ async function main() {
 			/* add to the end of plugins array */
 			esbuildProblemMatcherPlugin,
 		],
+		banner: {
+			js: `import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);`,
+		}
 	});
 	if (watch) {
 		await ctx.watch();

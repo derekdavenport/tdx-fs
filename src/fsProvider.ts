@@ -3,9 +3,102 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+function extractLinkFromHtml(html: string, linkText: string): string | undefined {
+	// Match <a> tags with href attribute containing the specified link text
+	const regex = new RegExp(`<a[^>]*href="([^"]*)"[^>]*>\\s*${linkText}\\s*</a>`, 'i');
+	const match = html.match(regex);
+	return match ? match[1] : undefined;
+}
+
+function extractLinkFromHtmlByTitle(html: string, title: string): string | undefined {
+	const regex = new RegExp(`<a[^>]*[^>]+href="([^"]*)"[^>]*[^>]+title="${title}"`, 'i');
+	const match = html.match(regex);
+	return match ? match[1] : undefined;
+}
+
+const getFieldValue = (html: string, fieldName: string): string => {
+	const regex = new RegExp(`<input[^>]*name="${fieldName}"[^>]*value="([^"]*)"`);
+	const match = html.match(regex);
+	return match ? match[1] : '';
+};
+
+const getCheckboxValue = (html: string, fieldName: string): string => {
+	const regex = new RegExp(`<input[^>]*name="${fieldName}"[^>]*value="([^"]*)"`);
+	const match = html.match(regex);
+	return match && match[0].includes('checked="checked"') ? 'true' : 'false';
+};
+
+const getSelectValue = (html: string, fieldName: string): string => {
+	const regex = new RegExp(`<select[^>]*name="${fieldName}"[^>]*>([\\s\\S]*?)<option[^>]*selected[^>]*value="([^"]*)"`);
+	const match = html.match(regex);
+	return match ? match[2] : '';
+};
+
+export interface TableData {
+	name: string;
+	url: string;
+	id: string;
+}
+function parseGridItems(html: string): TableData[] {
+	const modules: TableData[] = [];
+
+	// Find the gridItems table
+	const tableMatch = html.match(/<table[^>]*id="gridItems"[^>]*>[\s\S]*?<\/table>/i);
+	if (!tableMatch) {
+		throw new Error('Could not find gridItems table on HTML Modules page');
+	}
+
+	const tableHtml = tableMatch[0];
+
+	// Extract all rows from tbody
+	const tbodyMatch = tableHtml.match(/<tbody[^>]*>[\s\S]*?<\/tbody>/i);
+	if (!tbodyMatch) {
+		return modules;
+	}
+
+	const tbodyHtml = tbodyMatch[0];
+
+	// Extract each row
+	const rowRegex = /<tr[^>]*>[\s\S]*?<\/tr>/gi;
+	let rowMatch;
+
+	while ((rowMatch = rowRegex.exec(tbodyHtml)) !== null) {
+		const rowHtml = rowMatch[0];
+
+		// Extract columns (td elements)
+		const columns: string[] = [];
+		const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+		let cellMatch;
+
+		while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+			columns.push(cellMatch[1].trim());
+		}
+
+		if (columns.length < 2) {
+			continue;
+		}
+
+		const id = columns[0].trim();
+		// The second column has the link to the module
+		const secondColumnHtml = columns[1];
+		const linkMatch = secondColumnHtml.match(/<a[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>/i);
+
+		if (linkMatch) {
+			const url = linkMatch[1];
+			const name = linkMatch[2].trim();
+
+			if (name) {
+				modules.push({ name, url, id });
+			}
+		}
+	}
+
+	return modules;
+}
 
 import * as vscode from 'vscode';
 import { CookieJar } from 'tough-cookie';
+import CM from './client.js';
 
 export interface TdxSession {
 	baseUrl: string;
@@ -13,221 +106,556 @@ export interface TdxSession {
 	lastUpdated: number;
 }
 
-export class File implements vscode.FileStat {
+interface RemoteFileStat extends vscode.FileStat {
+	url?: string;
+	utime: number; // Last updated time from the server
+	name: string;
+	rawName: string;
+	load(): Promise<void>;
+}
+
+
+export class File implements RemoteFileStat {
 
 	type: vscode.FileType;
 	ctime: number;
 	mtime: number;
+	utime: number;
 	size: number;
 
 	name: string;
+	rawName: string;
+	parent: Directory;
 	data?: Uint8Array;
 	url?: string;
 
-	constructor(name: string, url?: string) {
+	constructor(name: string, parent: Directory, url: string | undefined = undefined) {
+		if (new.target === File) {
+			throw new TypeError("Cannot construct File instances directly");
+		}
 		this.type = vscode.FileType.File;
 		this.ctime = Date.now();
 		this.mtime = Date.now();
+		this.utime = 0;
 		this.size = 0;
 		this.name = name;
+		this.rawName = sanitizeFileName(name);
+		this.parent = null as any;  // Will be set when added to a directory
 		this.url = url;
+	}
+
+	async load(): Promise<void> {
+		// To be implemented by subclasses
+	}
+
+	async save(): Promise<void> {
+		// To be implemented by subclasses
 	}
 }
 
-export class Directory implements vscode.FileStat {
+export class Directory<T extends File | Directory = any> implements RemoteFileStat {
 
 	type: vscode.FileType;
 	ctime: number;
 	mtime: number;
+	utime: number;
 	size: number;
 
+	rawName: string;
 	name: string;
-	entries: Map<string, File | Directory>;
-	baseUrl?: string;  // Store metadata like the HTML Modules page URL
+	parent: Directory | null;
+	entries: Map<string, T>;
+	url?: string;  // Store metadata like the HTML Modules page URL
 
-	constructor(name: string, baseUrl?: string) {
+	constructor(name: string, parent: Directory | null = null, url: string | undefined = undefined) {
 		this.type = vscode.FileType.Directory;
 		this.ctime = Date.now();
 		this.mtime = Date.now();
+		this.utime = 0;
 		this.size = 0;
-		this.name = name;
+		this.rawName = name;
+		this.name = sanitizeFileName(name);
+		this.parent = parent;
 		this.entries = new Map();
-		this.baseUrl = baseUrl;
+		this.url = url;
+	}
+
+	async load(...args: any[]): Promise<void> {
+		// To be implemented by subclasses
 	}
 }
 
-export type Entry = File | Directory;
+class RootDirectory extends Directory {
+	url: string;
+	clientPortalAppsDirectory: ClientPortalAppsDirectory;
+	ticketingAppsDirectory: TicketingAppsDirectory;
+	
+	private tableCache: string;
+	private CACHE_DURATION_MS = 5 * 1000; // 5 seconds
 
-/**
- * Sanitize filenames by replacing problematic characters with safe alternatives.
- * Slashes are replaced with "／" to preserve readability while avoiding path ambiguity.
- */
-function sanitizeFileName(name: string): string {
-	return name.replace(/\//g, '／');
+	constructor() {
+		super('Apps');
+		this.url = new URL('/TDAdmin/BE/AppInstances/', CM.client.defaults.options.prefixUrl).toString();
+		this.clientPortalAppsDirectory = new ClientPortalAppsDirectory('Client Portal Apps', this);
+		this.ticketingAppsDirectory = new TicketingAppsDirectory('Ticketing Apps', this);
+
+		this.entries.set(this.clientPortalAppsDirectory.name, this.clientPortalAppsDirectory);
+		this.entries.set(this.ticketingAppsDirectory.name, this.ticketingAppsDirectory);
+
+		this.tableCache = '';
+	}
+
+	async getRootAppTable(): Promise<string> {
+		const now = Date.now();
+		if (now - this.utime > this.CACHE_DURATION_MS) {
+			// const appInstancesUrl = '/TDAdmin/BE/AppInstances/';
+			const html = await CM.client.get(this.url, {}).text();
+			this.utime = now;
+			// Find the grdAppInstances table
+			const tableMatch = html.match(/<table[^>]*id="grdAppInstances"[^>]*>[\s\S]*?<\/table>/i);
+			if (!tableMatch) {
+				throw new Error('Could not find grdAppInstances table on AppInstances page');
+			}
+
+			const tableHtml = tableMatch[0];
+
+			// Extract all rows from tbody
+			const tbodyMatch = tableHtml.match(/<tbody[^>]*>[\s\S]*?<\/tbody>/i);
+			if (!tbodyMatch) {
+				throw new Error('Could not find table body on AppInstances page');
+			}
+
+			const tbodyHtml = tbodyMatch[0];
+			this.tableCache = tbodyHtml;
+		}
+		return this.tableCache;
+	}
 }
+// a directory of apps of a certain type, e.g. directory of Ticketing apps
+class AppTypeDirectory<T extends AppType = AppType> extends Directory {
+	parent: RootDirectory;
+	idToNameMap: Map<string, string>;
 
-/**
- * Unsanitize filenames by reversing the sanitization.
- */
-function unsanitizeFileName(name: string): string {
-	return name.replace(/／/g, '/');
-}
-
-export class TdxFS implements vscode.FileSystemProvider {
-
-	root = new Directory('Apps');
-	private session?: TdxSession;
-	private moduleRefreshCallback?: () => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>;
-	private appRefreshCallback?: (appName: string) => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>;
-	private refreshTimestamps = new Map<string, number>();
-	private refreshDebounceMs = 5 * 1000; // 5 seconds
-	private isRefreshing = new Map<string, boolean>();
-
-	setSession(session: TdxSession | undefined): void {
-		this.session = session;
+	constructor(name: string, parent: RootDirectory) {
+		super(name, parent);
+		this.url = new URL('', parent.url).toString();
+		this.entries = new Map<string, AppDirectory<T>>();
+		this.parent = parent;
+		this.idToNameMap = new Map<string, string>();
 	}
 
-	getSession(): TdxSession | undefined {
-		return this.session;
-	}
+	protected async loadApps(appType: T) {
+		// @todo: maybe do a dif instead
+		// this.entries.clear();
+		const appTable = await this.parent.getRootAppTable();
 
-	setModuleRefreshCallback(callback: () => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>): void {
-		this.moduleRefreshCallback = callback;
-	}
+		// Extract each row
+		const rowRegex = /<tr[^>]*>[\s\S]*?<\/tr>/gi;
+		let rowMatch;
 
-	setAppRefreshCallback(callback: (appName: string) => Promise<{ modules: Array<{ name: string; url: string }>; htmlModulesPageUrl: string }>): void {
-		this.appRefreshCallback = callback;
-	}
+		const foundApps = new Map<string, TableData>();
+		while ((rowMatch = rowRegex.exec(appTable)) !== null) {
+			const rowHtml = rowMatch[0];
 
-	private async fetchWithCookieJar(url: string, options?: RequestInit): Promise<Response> {
-		const session = this.session;
-		if (!session) {
-			throw new Error('No active TeamDynamix session');
+			// Extract columns (td elements)
+			const columns: string[] = [];
+			const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+			let cellMatch;
+
+			while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+				columns.push(cellMatch[1].trim());
+			}
+
+			// check if app is the right type
+			if (columns.length < 3 || !columns[2].includes(appType)) {
+				continue;
+			}
+
+			// Column 0: App ID
+			const appIdText = columns[0].replace(/<[^>]*>/g, '').trim();
+			
+			// Column 1: App name from link
+			const appNameMatch = columns[1].match(/<a[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>/i);
+			if (!appNameMatch) {
+				continue;
+			}
+
+			const appUrl = appNameMatch[1];
+			const appName = appNameMatch[2].trim();
+
+			const app = { name: appName, url: appUrl, id: appIdText };
+			foundApps.set(appIdText, app);
+
+			// Subclasses will override this to create the correct type
+			//this.createAppInstance(appName, appUrl);
 		}
 
-		// Get cookies for this URL from the jar
-		const cookieHeader = await session.cookieJar.getCookieString(url);
+		// diff
+		const now = Date.now();
+		for (const [id, appData] of foundApps) {
+			// if we don't have this id, create it
+			if (!this.idToNameMap.has(id)) {
+				this.addApp(appData);
+			}
+			const oldName = this.idToNameMap.get(id);
+			const app = this.entries.get(oldName || '');
+			if (app) {
+				app.name = appData.name; // update name in case it changed, url won't change
+			}
+		}
+		// delete old
+		for (const entry of this.entries.values()) {
+			if (!foundApps.has(entry.id)) {
+				this.removeApp(entry);
+			}
+		}
+
+		// @todo: do I need to emit a change if there was a dif?
+	}
+
+	protected createChildInstance({ name, url, id }: TableData): AppDirectory<T> {
+		throw new Error('createChildInstance must be implemented by subclasses');
+		return new AppDirectory<T>(name, this, url, id);
+	}
+
+	protected addApp(tableData: TableData) {
+		// To be overridden by subclasses
+		this.entries.set(tableData.name, this.createChildInstance(tableData));
+		this.idToNameMap.set(tableData.id, tableData.name);
+	}
+
+	protected removeApp(app: AppDirectory<T>) {
+		this.idToNameMap.delete(app.id);
+		this.entries.delete(app.name);
+	}
+}
+
+// list of all the client portal apps
+class ClientPortalAppsDirectory extends AppTypeDirectory<'Client Portal'> {
+	entries: Map<string, ClientPortalApp>;
+	constructor(name: 'Client Portal Apps', parent: RootDirectory) {
+		super(name, parent);
+		this.entries = new Map();
+	}
+	
+	async load() {
+        await this.loadApps('Client Portal');
+		this.utime = Date.now();
+    }
+
+	protected createChildInstance({ name, url, id }: TableData) {
+		return new ClientPortalApp(name, this, url, id);
+	}
+}
+// list of all the ticketing apps
+class TicketingAppsDirectory extends AppTypeDirectory<'Ticketing'> {
+	entries: Map<string, TicketingApp>;
+	constructor(name: 'Ticketing Apps', parent: RootDirectory) {
+		super(name, parent);
+		this.entries = new Map<string, TicketingApp>();
+	}
+	async load() {
+        await this.loadApps('Ticketing');
+		this.utime = Date.now();
+    }
+
+	protected createChildInstance({ name, url, id }: TableData) {
+		return new TicketingApp(name, this, url, id);
+	}
+}
+
+// an app, such as Client Portal or Ticketing
+class AppDirectory<T extends AppType = AppType> extends Directory {
+	url: string;
+	parent: AppTypeDirectory<T>;
+	id: string;
+
+	constructor(name: string, parent: AppTypeDirectory<T>, url: string, id: string) {
+		super(name, parent, url);
+		this.parent = parent;
+		this.url = new URL(url, parent.url).toString();
+		this.id = id;
+	}
+}
+
+// a client portal app, currently only has 1 entry: HTML Modules Directory
+class ClientPortalApp extends AppDirectory<'Client Portal'> {
+	parent: ClientPortalAppsDirectory;
+	modulesDirectory: HTMLModulesDirectory;
+	constructor(name: string, parent: ClientPortalAppsDirectory, url: string, id: string) {
+		super(name, parent, url, id);
+		// actually can't be set in constructor because we don't know the url until this page loads
+		this.modulesDirectory = new HTMLModulesDirectory('HTML Modules', this);
+		this.parent = parent;
+		// @todo: don't set entries until load
+		this.entries.set(this.modulesDirectory.name, this.modulesDirectory);
+	}
+	// get the url of HTML Modules page
+	// @todo: this will never need to change
+	async load() {
+		if (this.utime) {
+			return;
+		}
+		const html = await CM.client.get(this.url).text();
+		const link = extractLinkFromHtml(html, 'HTML Modules');
+		if (!link) {
+			throw new Error('Could not find HTML Modules link on Client Portal app page');
+		}
+		this.modulesDirectory.url = new URL(link, this.url).toString();
+		this.utime = Date.now();
+		// fire change if different
+	}
+}
+// list of all the html modules
+class HTMLModulesDirectory extends Directory<HTMLModule> {
+	url: string | undefined = undefined;
+	idToNameMap: Map<string, string>;
+	newModuleUrl: URL | undefined = undefined;
+	constructor(name: 'HTML Modules', parent: ClientPortalApp, url: string | undefined = undefined) {
+		super(name, parent, url);
+		this.url = url ? new URL(url, parent.url).toString() : undefined;
+		this.entries = new Map<string, HTMLModule>();
+		this.idToNameMap = new Map<string, string>();
+	}
+
+	async load() {
+		if (!this.url) {
+			//wait
+			return;
+		}
+		const allModules: TableData[] = [];
+		let pageNumber = 1;
+		const maxPages = 100; // Safety limit to prevent infinite loops
+	
+		while (pageNumber <= maxPages) {
+			let pageUrl = this.url;
+			// Append page parameter if not the first page
+			if (pageNumber > 1) {
+				pageUrl += `?page=${pageNumber}`;
+			}
+	
+			try {
+				const html = await CM.client.get(pageUrl).text();
+				// get new link
+				if (!this.newModuleUrl) {
+					const newModuleLink = extractLinkFromHtmlByTitle(html, 'New HTML Module');
+					this.newModuleUrl = newModuleLink ? new URL(newModuleLink, this.url) : undefined;
+				}
+				const modules = parseGridItems(html);
+	
+				if (modules.length === 0) {
+					// No modules found, stop pagination
+					break;
+				}
+	
+				allModules.push(...modules);
+	
+				// Look for next page link in the tfoot - check if page N+1 exists
+				const tfootMatch = html.match(/<tfoot[^>]*>[\s\S]*?<\/tfoot>/i);
+				if (!tfootMatch) {
+					break;
+				}
+	
+				const tfootHtml = tfootMatch[0];
+	
+				// Look for a link with the next page number as text
+				const nextPageNumber = pageNumber + 1;
+				const nextPageRegex = new RegExp(`<a[^>]*href="([^"]*)"[^>]*>\\s*${nextPageNumber}\\s*</a>`, 'i');
+				const nextPageMatch = tfootHtml.match(nextPageRegex);
+	
+				if (!nextPageMatch) {
+					// No next page link found, we're done
+					break;
+				}
+	
+				pageNumber++;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				console.warn(`Failed to fetch page ${pageNumber}: ${message}`);
+				break;
+			}
+		}
+
+		// diff
+		const now = Date.now();
+		for (const moduleData of allModules) {
+			// if we don't have this id, create it
+			if (!this.idToNameMap.has(moduleData.id)) {
+				this.addChild(moduleData);
+			}
+			const oldName = this.idToNameMap.get(moduleData.id);
+			const module = this.entries.get(oldName || '');
+			if (module) {
+				module.name = moduleData.name; // update name in case it changed, url won't change
+				module.utime = now;
+			}
+		}
+		// delete old
+		for (const module of this.entries.values()) {
+			if (module.utime < now) {
+				this.removeChild(module);
+			}
+		}
+	
+		this.utime = Date.now();
+	}
+
+	protected addChild(data: TableData) {
+		this.entries.set(data.name, new HTMLModule(data.name, this, data.url));
+		this.idToNameMap.set(data.id, data.name);
+	}
+
+	protected removeChild(module: HTMLModule) {
+		this.idToNameMap.delete(module.id);
+		this.entries.delete(module.name);
+	}
+
+}
+
+class TicketingApp extends AppDirectory<'Ticketing'> {
+	parent: TicketingAppsDirectory;
+	notificationTemplatesDirectory: NotificationTemplatesDirectory;
+	constructor(name: string, parent: TicketingAppsDirectory, url: string, id: string) {
+		super(name, parent, url, id);
+		this.notificationTemplatesDirectory = new NotificationTemplatesDirectory('Notification Templates', this, url);
+		this.parent = parent;
+		this.entries.set(this.notificationTemplatesDirectory.name, this.notificationTemplatesDirectory);
+	}
+}
+
+class NotificationTemplatesDirectory extends Directory<NotificationTemplate> {
+	constructor(name: 'Notification Templates', parent: TicketingApp, url: string) {
+		super(name, parent, url);
+		this.entries = new Map<string, NotificationTemplate>();
+	}
+}
+
+
+class ClientPortalDirectory<T extends 'Client Portal'> extends AppDirectory<T> {
+
+}
+
+
+
+class HTMLModule extends File {
+	parent: HTMLModulesDirectory;
+	url: string;
+	id: string;
+	fields: Map<string, string>;
+	constructor(name: string, parent: HTMLModulesDirectory, url: string) {
+		super(name, parent, url);
+		this.parent = parent;
+		this.url = new URL(url, parent.url).toString();
+		this.fields = new Map<string, string>();
+		this.id = url.split('ModID=')[1] || '0';
+	}
+
+	async load() {
+		const html = await CM.client.get(this.url).text();
+
+		// Extract content from appropriate textarea
+		// @todo: don't dupe code with NotificationTemplate
+		const contentMatch = html.match(/<textarea[^>]*id="CKEContent_Content"[^>]*>([\s\S]*?)<\/textarea>/i);
+
+		if (!contentMatch) {
+			throw new Error(`Could not find HTML content in the fetched page for file: ${this.name}`);
+		}
+		// @todo: mark read only
+
+
+		const escapedContent = contentMatch[1];
+
+		// Unescape HTML entities - do &amp; last to avoid double-unescaping
+		const unescaped = escapedContent
+			.replace(/&lt;/g, '<')
+			.replace(/&gt;/g, '>')
+			.replace(/&quot;/g, '"')
+			.replace(/&#039;/g, "'")
+			.replace(/&amp;/g, '&');
+
+		// Cache the content in the file object
+		const contentBuffer = Buffer.from(unescaped, 'utf8');
+		this.data = new Uint8Array(contentBuffer);
+		this.size = this.data.length;
+
+		this.fields.set('__RequestVerificationToken', getFieldValue(html, '__RequestVerificationToken'));
+		this.fields.set('IsForNext', getFieldValue(html, 'IsForNext') || 'False');
+		this.fields.set('IsForClient', getFieldValue(html, 'IsForClient') || 'True');
+		this.fields.set('ModuleClientPortalApplicationID', getFieldValue(html, 'ModuleClientPortalApplicationID') || '');
+		this.fields.set('ClientPortalCategoryName', getSelectValue(html,'ClientPortalCategoryName') || 'TDClient');
+		this.fields.set('ShowBorder', getCheckboxValue(html, 'ShowBorder') || 'false');
+		this.fields.set('ShowName', getCheckboxValue(html, 'ShowName') || 'false');
+		this.fields.set('IsSanitized', 'True');
+		this.fields.set('IsSanitized', 'false');
+		this.fields.set('CKEContent.EditorKey', getFieldValue(html, 'CKEContent.EditorKey') || '');
 		
-		// Prepare headers with cookies
-		const headers = new Headers(options?.headers || {});
-		if (cookieHeader) {
-			headers.set('Cookie', cookieHeader);
+		this.utime = Date.now();
+	}
+
+	async save() {
+		if (!this.data) {
+			throw new Error(`No data loaded for file: ${this.name}. Please call load() before accessing content.`);
+		}
+		//		editPageUrl = new URL('HtmlModuleEdit', baseUrlPath).toString();;
+		// /TDAdmin/71907D89-441A-48BE-9CD6-A59A2C5EA305/277/DesktopTemplates/DesktopModuleEditSave?moduleID=0
+		const saveUrl = new URL('DesktopModuleEditSave', this.url);
+		saveUrl.searchParams.append('moduleID', this.id);
+
+		this.fields.set('Name', this.rawName);  // Use the original module name, not the sanitized one
+		this.fields.set('CKEContent.Content',  Buffer.from(this.data).toString('utf-8'));
+
+		// Convert Map to URLSearchParams
+		const formData = new URLSearchParams();
+		for (const [key, value] of this.fields) {
+			formData.append(key, value);
 		}
 
-		// Make the request
-		const response = await fetch(url, {
-			...options,
-			headers,
+		const saveResponse = await CM.client.post(saveUrl, {
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+				'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+				// 'Referer': fullUrl,
+				// 'Origin': new URL(session.baseUrl).origin,
+				'Sec-Fetch-Dest': 'empty',
+				'Sec-Fetch-Mode': 'cors',
+				'Sec-Fetch-Site': 'same-origin',
+			},
+			body: formData.toString(),
 		});
 
-		// Extract and store any Set-Cookie headers from the response
-		const setCookieHeaders = response.headers.getSetCookie?.() || [];
-		for (const setCookieHeader of setCookieHeaders) {
-			try {
-				await session.cookieJar.setCookie(setCookieHeader, url);
-			} catch (error) {
-				// Silently ignore cookie parsing errors - some cookies may be malformed
-			}
-		}
+		// Accept both successful responses (2xx) and redirects (3xx)
+		if (saveResponse.statusCode < 200 || saveResponse.statusCode >= 400) {
 
-		return response;
+			throw new Error(`Failed to save file: ${saveResponse.statusCode} ${saveResponse.statusMessage}`);
+		}
+		// modID is correct
+		const newId = saveResponse.headers.location?.split('?modID=')[1];
+		if (!newId) {
+			throw new Error(`Failed to extract module ID from save response. Location header: ${saveResponse.headers.location}`);
+		}
+		this.id = newId;
+	}
+}
+
+class NotificationTemplate extends File {
+	parent: NotificationTemplatesDirectory;
+	url: string;
+	constructor(name: string, parent: NotificationTemplatesDirectory, url: string) {
+		super(name, parent);
+		this.parent = parent;
+		this.url = url;
 	}
 
-	async fetchFileContent(fileName: string): Promise<string> {
-		const session = this.session;
-		if (!session) {
-			throw new Error('No active TeamDynamix session');
-		}
+	
+	async load() {
+		const html = await CM.client.get(this.url).text();
 
-		// Find the file - search in nested structure
-		let file: File | undefined;
-		
-		// Check Client Portal Apps
-		const clientPortalAppsDir = this.root.entries.get('Client Portal Apps');
-		if (clientPortalAppsDir && clientPortalAppsDir instanceof Directory) {
-			for (const appEntry of clientPortalAppsDir.entries.values()) {
-				if (appEntry instanceof Directory) {
-					const htmlModulesDir = appEntry.entries.get('HTML Modules');
-					if (htmlModulesDir && htmlModulesDir instanceof Directory) {
-						const sanitizedName = sanitizeFileName(fileName);
-						const foundFile = htmlModulesDir.entries.get(sanitizedName) as File;
-						if (foundFile) {
-							file = foundFile;
-							break;
-						}
-					}
-				}
-			}
-		}
+		// Extract content from appropriate textarea
+		const contentMatch = html.match(/<textarea[^>]*id="txtTemplate"[^>]*>([\s\S]*?)<\/textarea>/i);
 
-		// Check Ticketing Apps
-		if (!file) {
-			const ticketingAppsDir = this.root.entries.get('Ticketing Apps');
-			if (ticketingAppsDir && ticketingAppsDir instanceof Directory) {
-				for (const appEntry of ticketingAppsDir.entries.values()) {
-					if (appEntry instanceof Directory) {
-						// Check Notification Templates
-						const notificationTemplatesDir = appEntry.entries.get('Notification Templates');
-						if (notificationTemplatesDir && notificationTemplatesDir instanceof Directory) {
-							const sanitizedName = sanitizeFileName(fileName);
-							const foundFile = notificationTemplatesDir.entries.get(sanitizedName) as File;
-							if (foundFile) {
-								file = foundFile;
-								break;
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// Fallback check in root level HTML Modules for compatibility
-		if (!file) {
-			const htmlModulesDir = this.root.entries.get('HTML Modules');
-			if (htmlModulesDir && htmlModulesDir instanceof Directory) {
-				const sanitizedName = sanitizeFileName(fileName);
-				file = htmlModulesDir.entries.get(sanitizedName) as File;
-			}
-		}
-
-		// Fallback check in root for compatibility
-		if (!file) {
-			const sanitizedName = sanitizeFileName(fileName);
-			const entry = this.root.entries.get(sanitizedName);
-			if (entry && entry instanceof File) {
-				file = entry;
-			}
-		}
-		
-		if (!file) {
-			throw new Error(`File not found: "${fileName}"`);
-		}
-
-		if (!file.url) {
-			throw new Error(`No URL found for file: ${fileName}`);
-		}
-
-		const fullUrl = new URL(file.url, session.baseUrl).toString();
-
-		const response = await this.fetchWithCookieJar(fullUrl);
-
-		if (!response.ok) {
-			throw new Error(`Failed to fetch file ${fileName}: ${response.statusText}`);
-		}
-
-		const html = await response.text();
-
-		// Extract the HTML content from the textarea with id="CKEContent_Content"
-		let contentMatch = html.match(/<textarea[^>]*id="CKEContent_Content"[^>]*>([\s\S]*?)<\/textarea>/i);
 		if (!contentMatch) {
-			contentMatch = html.match(/<div[^>]*class="well code"[^>]*>([\s\S]*?)<\/div>/i);
-			// If that's not there, 
-			if (!contentMatch) {
-				throw new Error(`Could not find HTML content in the fetched page for file: ${fileName}`);
-			}
-			contentMatch[1] = contentMatch[1].trim().replace(/<br\s*\/?>/gi, '\n');
-			// @todo: mark read only
-
+			throw new Error(`Could not find HTML content in the fetched page for file: ${this.name}`);
 		}
 
 		const escapedContent = contentMatch[1];
@@ -242,278 +670,40 @@ export class TdxFS implements vscode.FileSystemProvider {
 
 		// Cache the content in the file object
 		const contentBuffer = Buffer.from(unescaped, 'utf8');
-		file.data = new Uint8Array(contentBuffer);
-		file.size = file.data.length;
-
-		return unescaped;
+		this.data = new Uint8Array(contentBuffer);
+		this.size = this.data.length;
+		this.utime = Date.now();
 	}
+}
 
-	async saveFileContent(fileName: string, htmlContent: string): Promise<void> {
-		const session = this.session;
-		if (!session) {
-			throw new Error('No active TeamDynamix session');
-		}
 
-		// Find the file - search in nested structure
-		let file: File | undefined;
-		let parentDir: Directory | undefined;
-		
-		// Check Client Portal Apps
-		const clientPortalAppsDir = this.root.entries.get('Client Portal Apps');
-		if (clientPortalAppsDir && clientPortalAppsDir instanceof Directory) {
-			for (const appEntry of clientPortalAppsDir.entries.values()) {
-				if (appEntry instanceof Directory) {
-					const htmlModulesDir = appEntry.entries.get('HTML Modules');
-					if (htmlModulesDir && htmlModulesDir instanceof Directory) {
-						const sanitizedName = sanitizeFileName(fileName);
-						const foundFile = htmlModulesDir.entries.get(sanitizedName) as File;
-						if (foundFile) {
-							file = foundFile;
-							parentDir = htmlModulesDir;
-							break;
-						}
-					}
-				}
-			}
-		}
+export type Entry = File | RootDirectory | AppTypeDirectory | AppDirectory;
 
-		// Check Ticketing Apps
-		if (!file) {
-			const ticketingAppsDir = this.root.entries.get('Ticketing Apps');
-			if (ticketingAppsDir && ticketingAppsDir instanceof Directory) {
-				for (const appEntry of ticketingAppsDir.entries.values()) {
-					if (appEntry instanceof Directory) {
-						// Check Notification Templates
-						const notificationTemplatesDir = appEntry.entries.get('Notification Templates');
-						if (notificationTemplatesDir && notificationTemplatesDir instanceof Directory) {
-							const sanitizedName = sanitizeFileName(fileName);
-							const foundFile = notificationTemplatesDir.entries.get(sanitizedName) as File;
-							if (foundFile) {
-								file = foundFile;
-								parentDir = notificationTemplatesDir;
-								break;
-							}
-						}
-					}
-				}
-			}
-		}
+/**
+ * Sanitize filenames by replacing problematic characters with safe alternatives.
+ * Slashes are replaced with "／" to preserve readability while avoiding path ambiguity.
+ */
+function sanitizeFileName(name: string): string {
+	return name.replace(/\//g, '／');
+}
 
-		// Fallback check in root level HTML Modules for compatibility
-		if (!file) {
-			const htmlModulesDir = this.root.entries.get('HTML Modules');
-			if (htmlModulesDir && htmlModulesDir instanceof Directory) {
-				const sanitizedName = sanitizeFileName(fileName);
-				file = htmlModulesDir.entries.get(sanitizedName) as File;
-				if (file) {
-					parentDir = htmlModulesDir;
-				}
-			}
-		}
-		
-		// Fallback check in root for compatibility
-		if (!file) {
-			const sanitizedName = sanitizeFileName(fileName);
-			const entry = this.root.entries.get(sanitizedName);
-			if (entry && entry instanceof File) {
-				file = entry;
-				parentDir = this.root;
-			}
-		}
-		
-		if (!file) {
-			throw new Error(`File not found: "${fileName}"`);
-		}
-		
-		// For new files without a URL, construct a default URL with moduleId = 0
-		let moduleId = '0';
-		let editPageUrl: string;
-		
-		if (file.url) {
-			editPageUrl = file.url;
-			// Extract the moduleId from the URL if it exists
-			const moduleIdMatch = file.url.match(/modID=(\d+)/i);
-			moduleId = moduleIdMatch ? moduleIdMatch[1] : '0';
-		} else {
-			// New module - use the parent directory's baseUrl if available (for HTML Modules)
-			if (parentDir?.baseUrl) {
-				// Extract the base path from the htmlModulesPageUrl and append 
-				const baseUrlPath = parentDir.baseUrl.replace(/^([^?]*).*$/, '$1');
-				editPageUrl = new URL('HtmlModuleEdit', baseUrlPath).toString();
-			} else {
-				throw new Error(`Cannot determine edit page URL for new file: "${fileName}"`);
-			}
-		}
+interface RootAppTableCache {
+	html: string;
+	lastFetched: number;
+}
 
-		// Fetch the edit page to extract all form fields
-		const fullUrl = new URL(editPageUrl, session.baseUrl).toString();
-		const response = await this.fetchWithCookieJar(fullUrl, {
-			redirect: 'manual'  // Don't follow redirects automatically
-		});
+const appTypes = ['Client Portal', 'Ticketing'] as const;
+type AppType = (typeof appTypes)[number];
+type Apps = {
+	[appType in AppType]: AppDirectory[];
+};
 
-		if (response.status === 302 || response.status === 301 || response.status === 303 || response.status === 307) {
-			console.error(`[TdxFS] Got redirect! This likely means cookies are stale. Redirect URL: ${response.headers.get('location')}`);
-			throw new Error(`Got redirect when fetching edit page - cookies may be stale`);
-		}
+export class TdxFS implements vscode.FileSystemProvider {
 
-		if (!response.ok) {
-			throw new Error(`Failed to fetch edit page for form fields: ${response.statusText}`);
-		}
+	root: RootDirectory;
 
-		const html = await response.text();
-
-		// Extract form field values using regex
-		const getFieldValue = (fieldName: string): string => {
-			const regex = new RegExp(`<input[^>]*name="${fieldName}"[^>]*value="([^"]*)"`);
-			const match = html.match(regex);
-			return match ? match[1] : '';
-		};
-
-		const getCheckboxValue = (fieldName: string): string => {
-			const regex = new RegExp(`<input[^>]*name="${fieldName}"[^>]*value="([^"]*)"`);
-			const match = html.match(regex);
-			return match && match[0].includes('checked="checked"') ? 'true' : 'false';
-		};
-
-		const getSelectValue = (fieldName: string): string => {
-			const regex = new RegExp(`<select[^>]*name="${fieldName}"[^>]*>([\\s\\S]*?)<option[^>]*selected[^>]*value="([^"]*)"`);
-			const match = html.match(regex);
-			return match ? match[2] : '';
-		};
-
-		// Extract a FRESH token right before saving
-		const tokenMatch = html.match(/<input[^>]*name="__RequestVerificationToken"[^>]*value="([^"]*)"/i);
-		let token = tokenMatch ? tokenMatch[1] : '';
-		if (!token) {
-			throw new Error('Could not extract verification token from edit page');
-		}
-
-		// Construct the save URL
-		const base = file.url ? session.baseUrl + file.url : parentDir?.baseUrl;
-		if (!base) {
-			throw new Error(`Cannot determine base url for saving file: "${fileName}"`);
-		}
-		//		editPageUrl = new URL('HtmlModuleEdit', baseUrlPath).toString();;
-		// /TDAdmin/71907D89-441A-48BE-9CD6-A59A2C5EA305/277/DesktopTemplates/DesktopModuleEditSave?moduleID=0
-		const saveUrl = new URL('DesktopModuleEditSave', base);
-		saveUrl.searchParams.append('moduleID', moduleId);
-		const saveUrlString = saveUrl.toString();
-
-		// Construct the form data with all fields from the example
-		const formData = new URLSearchParams();
-		formData.append('__RequestVerificationToken', token);
-		formData.append('IsForNext', getFieldValue('IsForNext') || 'False');
-		formData.append('IsForClient', getFieldValue('IsForClient') || 'True');
-		formData.append('ModuleClientPortalApplicationID', getFieldValue('ModuleClientPortalApplicationID') || '');
-		formData.append('ClientPortalCategoryName', getSelectValue('ClientPortalCategoryName') || 'TDClient');
-		formData.append('Name', file.name);  // Use the original module name, not the sanitized one
-		formData.append('ShowBorder', getCheckboxValue('ShowBorder') || 'false');
-		formData.append('ShowName', getCheckboxValue('ShowName') || 'false');
-		formData.append('IsSanitized', 'True');
-		formData.append('IsSanitized', 'false');
-		formData.append('CKEContent.Content', htmlContent);
-		formData.append('CKEContent.EditorKey', getFieldValue('CKEContent.EditorKey') || '');
-
-		const formBody = formData.toString();
-
-		const saveResponse = await this.fetchWithCookieJar(saveUrl.toString(), {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/x-www-form-urlencoded',
-				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
-				'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-				'Referer': fullUrl,
-				'Origin': new URL(session.baseUrl).origin,
-				'X-Requested-With': 'XMLHttpRequest',
-				'Sec-Fetch-Dest': 'empty',
-				'Sec-Fetch-Mode': 'cors',
-				'Sec-Fetch-Site': 'same-origin',
-			},
-			body: formBody,
-		});
-
-		// Accept both successful responses (2xx) and redirects (3xx)
-		if (saveResponse.status < 200 || saveResponse.status >= 400) {
-			throw new Error(`Failed to save file: ${saveResponse.status} ${saveResponse.statusText}`);
-		}
-	}
-
-	setClientPortalApps(apps: Array<{ appName: string; htmlModulesPageUrl?: string; modules: Array<{ name: string; url: string }> }>): void {
-		// Create or get the "Client Portal Apps" directory
-		let clientPortalAppsDir = this.root.entries.get('Client Portal Apps') as Directory | undefined;
-		if (!clientPortalAppsDir) {
-			clientPortalAppsDir = new Directory('Client Portal Apps');
-			this.root.entries.set('Client Portal Apps', clientPortalAppsDir);
-		}
-
-		// Clear existing apps
-		clientPortalAppsDir.entries.clear();
-
-		// Populate each Client Portal app
-		for (const app of apps) {
-			const sanitizedAppName = sanitizeFileName(app.appName);
-			const appDir = new Directory(app.appName);
-			clientPortalAppsDir.entries.set(sanitizedAppName, appDir);
-
-			// Create HTML Modules subdirectory
-			const htmlModulesDir = new Directory('HTML Modules', app.htmlModulesPageUrl);
-			appDir.entries.set('HTML Modules', htmlModulesDir);
-
-			// Populate HTML Modules
-			for (const module of app.modules) {
-				const sanitizedModuleName = sanitizeFileName(module.name);
-				const file = new File(module.name, module.url);
-				htmlModulesDir.entries.set(sanitizedModuleName, file);
-			}
-		}
-	}
-
-	setClientPortalApp(app: { appName: string; htmlModulesPageUrl?: string; modules: Array<{ name: string; url: string }> }): void {
-		// Create or get the "Client Portal Apps" directory
-		let clientPortalAppsDir = this.root.entries.get('Client Portal Apps') as Directory | undefined;
-		if (!clientPortalAppsDir) {
-			clientPortalAppsDir = new Directory('Client Portal Apps');
-			this.root.entries.set('Client Portal Apps', clientPortalAppsDir);
-		}
-
-		// Update only this specific app (preserves other apps)
-		const sanitizedAppName = sanitizeFileName(app.appName);
-		const appDir = new Directory(app.appName);
-		clientPortalAppsDir.entries.set(sanitizedAppName, appDir);
-
-		// Create HTML Modules subdirectory
-		const htmlModulesDir = new Directory('HTML Modules', app.htmlModulesPageUrl);
-		appDir.entries.set('HTML Modules', htmlModulesDir);
-
-		// Populate HTML Modules
-		for (const module of app.modules) {
-			const sanitizedModuleName = sanitizeFileName(module.name);
-			const file = new File(module.name, module.url);
-			htmlModulesDir.entries.set(sanitizedModuleName, file);
-		}
-	}
-
-	setTicketingApps(apps: Array<{ appName: string }>): void {
-		// Create or get the "Ticketing Apps" directory
-		let ticketingAppsDir = this.root.entries.get('Ticketing Apps') as Directory | undefined;
-		if (!ticketingAppsDir) {
-			ticketingAppsDir = new Directory('Ticketing Apps');
-			this.root.entries.set('Ticketing Apps', ticketingAppsDir);
-		}
-
-		// Clear existing apps
-		ticketingAppsDir.entries.clear();
-
-		// Populate each Ticketing app
-		for (const app of apps) {
-			const sanitizedAppName = sanitizeFileName(app.appName);
-			const appDir = new Directory(app.appName);
-			ticketingAppsDir.entries.set(sanitizedAppName, appDir);
-
-			// Create Notification Templates subdirectory (placeholder for now)
-			const notificationTemplatesDir = new Directory('Notification Templates');
-			appDir.entries.set('Notification Templates', notificationTemplatesDir);
-		}
+	constructor() {
+		this.root = new RootDirectory();
 	}
 
 	// --- manage file metadata
@@ -523,21 +713,9 @@ export class TdxFS implements vscode.FileSystemProvider {
 		return result;
 	}
 
-	readDirectory(uri: vscode.Uri): [string, vscode.FileType][] {
+	async readDirectory(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
 		const entry = this._lookupAsDirectory(uri, false);
-		
-		// Determine if this is a root read or app-specific read, and trigger appropriate refresh
-		if (uri.path === '/') {
-			// Root read: refresh app lists
-			this._triggerRefreshIfNeeded('root', this.moduleRefreshCallback);
-		} else {
-			// Check if this is an app folder read (e.g., /Client Portal Apps/[AppName])
-			const appMatch = uri.path.match(/^\/(Client Portal Apps|Ticketing Apps)\/([^\/]+)$/);
-			if (appMatch && this.appRefreshCallback) {
-				const appName = decodeURIComponent(appMatch[2]);
-				this._triggerRefreshIfNeeded(`app:${appName}`, () => this.appRefreshCallback!(appName));
-			}
-		}
+		await entry.load();
 		
 		const result: [string, vscode.FileType][] = [];
 		for (const [name, child] of entry.entries) {
@@ -546,52 +724,22 @@ export class TdxFS implements vscode.FileSystemProvider {
 		return result;
 	}
 
-	private _triggerRefreshIfNeeded(path: string, callback?: () => Promise<any>): void {
-		if (!callback) return;
-		
-		const now = Date.now();
-		const lastRefresh = this.refreshTimestamps.get(path) ?? 0;
-		const isRefreshing = this.isRefreshing.get(path) ?? false;
-		
-		if (now - lastRefresh >= this.refreshDebounceMs && !isRefreshing) {
-			this.refreshTimestamps.set(path, now);
-			this.isRefreshing.set(path, true);
-			
-			void callback()
-				.catch((error) => {
-					console.error(`[TdxFS] Failed to refresh ${path}: ${error}`);
-				})
-				.finally(() => {
-					this.isRefreshing.set(path, false);
-				});
-		}
-	}
-
 	// --- manage file contents
 
-	readFile(uri: vscode.Uri): Uint8Array {
+	async readFile(uri: vscode.Uri): Promise<Uint8Array> {
 		const file = this._lookupAsFile(uri, false);
-		
+
+		await file.load();
+		// this._fireSoon({ type: vscode.FileChangeType.Changed, uri });
 		if (file.data) {
 			return file.data;
 		}
-		
-		// File not cached, start fetching in background
-		const fileName = decodeURIComponent(uri.path.split('/').pop() || '');
-		
-		void this.fetchFileContent(fileName)
-			.then(() => {
-				this._fireSoon({ type: vscode.FileChangeType.Changed, uri });
-			})
-			.catch((error) => {
-				console.error(`[TdxFS] Failed to fetch content for ${fileName}: ${error}`);
-			});
 		
 		// Return empty buffer for now - VS Code will reload when fetch completes
 		return new Uint8Array(0);
 	}
 
-	writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean, overwrite: boolean }): void {
+	async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean, overwrite: boolean }) {
 		const basename = uri.path.split('/').pop()!;
 		const decodedBasename = decodeURIComponent(basename);
 		const parent = this._lookupParentDirectory(uri);
@@ -606,22 +754,32 @@ export class TdxFS implements vscode.FileSystemProvider {
 			throw vscode.FileSystemError.FileExists(uri);
 		}
 		if (!entry) {
-			entry = new File(decodedBasename);
-			parent.entries.set(decodedBasename, entry);
+			if (parent instanceof HTMLModulesDirectory) {
+				if (!parent.newModuleUrl) {
+					throw new Error('Cannot create new HTML Module because the "New" link is not available. Please refresh the directory.');
+				}
+				const module = new HTMLModule(decodedBasename, parent, parent.newModuleUrl.toString());
+				parent.entries.set(decodedBasename, module);
+				// get necessary fields
+				await module.load();
+				entry = module;
+			}
+			else if (parent instanceof NotificationTemplatesDirectory) {
+				const template = new NotificationTemplate(decodedBasename, parent, '0');
+				parent.entries.set(decodedBasename, template);
+				entry = template;
+			}
+			else {
+				throw new Error(`Cannot create file in directory of type ${parent.constructor.name}`);
+			}
 			this._fireSoon({ type: vscode.FileChangeType.Created, uri });
 		}
 		entry.mtime = Date.now();
 		entry.size = content.byteLength;
 		entry.data = content;
+		entry.save();
 
 		this._fireSoon({ type: vscode.FileChangeType.Changed, uri });
-
-		// Save to TeamDynamix in the background
-		const htmlContent = Buffer.from(content).toString('utf-8');
-		void this.saveFileContent(decodedBasename, htmlContent)
-			.catch((error) => {
-				console.error(`[TdxFS] Background save failed for ${decodedBasename}: ${error}`);
-			});
 	}
 
 	// --- manage files/folders
@@ -636,16 +794,17 @@ export class TdxFS implements vscode.FileSystemProvider {
 		const oldParent = this._lookupParentDirectory(oldUri);
 
 		const newParent = this._lookupParentDirectory(newUri);
+		// check if new parent can accept this type of entry
 		const newName = decodeURIComponent(newUri.path.split('/').pop() || '');
 
-		oldParent.entries.delete(entry.name);
-		entry.name = newName;
-		newParent.entries.set(newName, entry);
+		// oldParent.entries.delete(entry.name);
+		// entry.name = newName;
+		// newParent.entries.set(newName, entry);
 
-		this._fireSoon(
-			{ type: vscode.FileChangeType.Deleted, uri: oldUri },
-			{ type: vscode.FileChangeType.Created, uri: newUri }
-		);
+		// this._fireSoon(
+		// 	{ type: vscode.FileChangeType.Deleted, uri: oldUri },
+		// 	{ type: vscode.FileChangeType.Created, uri: newUri }
+		// );
 	}
 
 	delete(uri: vscode.Uri): void {
@@ -703,7 +862,7 @@ export class TdxFS implements vscode.FileSystemProvider {
 		return entry;
 	}
 
-	private _lookupAsDirectory(uri: vscode.Uri, silent: boolean): Directory {
+	private _lookupAsDirectory(uri: vscode.Uri, silent: boolean): Directory<File | Directory> {
 		const entry = this._lookup(uri, silent);
 		if (entry instanceof Directory) {
 			return entry;
@@ -719,7 +878,7 @@ export class TdxFS implements vscode.FileSystemProvider {
 		throw vscode.FileSystemError.FileIsADirectory(uri);
 	}
 
-	private _lookupParentDirectory(uri: vscode.Uri): Directory {
+	private _lookupParentDirectory(uri: vscode.Uri): Directory<File | Directory> {
 		const dirname = uri.with({ path: uri.path.substring(0, uri.path.lastIndexOf('/')) });
 		return this._lookupAsDirectory(dirname, false);
 	}

@@ -3,6 +3,7 @@
   "displayName": "TeamDynamix HTML Modules File System",
   "description": "",
   "version": "1.0.0",
+  "type": "module",
   "engines": {
     "vscode": "^1.125.0"
   },
@@ -57,6 +58,7 @@
     "test": "vscode-test"
   },
   "dependencies": {
+    "got": "^15.1.0",
     "playwright-core": "^1.55.0",
     "tough-cookie": "^6.0.2"
   },
