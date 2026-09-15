@@ -39,6 +39,7 @@ export interface TableData {
 	url: string;
 	id: string;
 }
+
 function parseGridItems(html: string): TableData[] {
 	const modules: TableData[] = [];
 
@@ -521,6 +522,22 @@ class TicketingApp extends AppDirectory<'Ticketing'> {
 		this.parent = parent;
 		this.entries.set(this.notificationTemplatesDirectory.name, this.notificationTemplatesDirectory);
 	}
+
+	// get the url of Notification Templates page
+	// @todo: this will never need to change
+	async load() {
+		if (this.utime) {
+			return;
+		}
+		const html = await CM.client.get(this.url).text();
+		const link = extractLinkFromHtml(html, 'Notification Templates');
+		if (!link) {
+			throw new Error('Could not find HTML Modules link on Client Portal app page');
+		}
+		this.notificationTemplatesDirectory.url = new URL(link, this.url).toString();
+		this.utime = Date.now();
+		// fire change if different
+	}
 }
 
 class NotificationTemplatesDirectory extends Directory<NotificationTemplate> {
@@ -528,6 +545,153 @@ class NotificationTemplatesDirectory extends Directory<NotificationTemplate> {
 		super(name, parent, url);
 		this.entries = new Map<string, NotificationTemplate>();
 	}
+
+	async load() {
+		if (!this.url) {
+			//wait
+			return;
+		}
+		const rows = await getTableRows(this.url, 'grdEventTypes');
+		for (const row of rows) {
+			if (!row['Event Name']?.text || !row['Event Name']?.href) {
+				console.log('Skipping row due to missing Event Name or URL:', row);
+				continue;
+			}
+			if (this.entries.has(row['Event Name'].text)) {
+				console.log('Skipping row because it already exists:', row);
+				continue;
+			}
+			this.entries.set(row['Event Name'].text, new NotificationTemplate(row['Event Name'].text, this, row['Event Name'].href ?? ''));
+		}
+		console.log('Total notification rows processed:', rows.length);
+	}
+}
+
+function parseTable(html: string, id: string) {
+	const rows: Record<string, { href?: string; text: string }>[] = [];
+
+	// Find the gridItems table
+	const tableMatch = html.match(new RegExp(`<table[^>]*id="${id}"[^>]*>([\\s\\S]*?)<\\/table>`, 'i'));
+	if (!tableMatch) {
+		throw new Error(`Could not find ${id} table on HTML Modules page`);
+	}
+
+	const tableHtml = tableMatch[1];
+
+	const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+	const headerRegex = /<th[^>]*>([\s\S]*?)<\/th>/gi;
+
+	// get column headers from thead row
+	const theadMatch = tableHtml.match(/<thead[^>]*>([\s\S]*?)<\/thead>/i);
+	if (!theadMatch) {
+		throw new Error(`Could not find thead in ${id} table on HTML Modules page`);
+	}
+
+	const theadHtml = theadMatch[1];
+	const headers = [];
+	let rowMatch = rowRegex.exec(theadHtml);
+	if (rowMatch) {
+		const rowHtml = rowMatch[1];
+		let headerMatch;
+		while ((headerMatch = headerRegex.exec(rowHtml)) !== null) {
+			const headerText = headerMatch[1].replace(/\s*<span class="sr-only">[\s\S]*?<\/span>/g, '').replace(/<[^>]*>/g, '').trim();
+			headers.push(headerText);
+		}
+	}
+
+	// Extract all rows from tbody
+	const tbodyMatch = tableHtml.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
+	if (!tbodyMatch) {
+		return rows;
+	}
+
+	const tbodyHtml = tbodyMatch[1];
+	rowRegex.lastIndex = 0;
+	while ((rowMatch = rowRegex.exec(tbodyHtml)) !== null) {
+		const rowHtml = rowMatch[1];
+
+		// Extract columns (td elements)
+		const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+		let cellMatch;
+
+		const row: (typeof rows)[number] = {};
+		let headerIndex = 0;
+		while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
+			let value = cellMatch[1].trim();
+			const href = extractHref(value);
+			const text = value.replace(/<[^>]*>/g, '').trim();
+			row[headers[headerIndex]] = {
+				href,
+				text,
+			};
+			headerIndex++;
+		}
+		rows.push(row);
+	}
+
+	return rows;
+}
+
+function extractHref(html: string): string | undefined {
+	return html.match(/href="([^"]*)"/i)?.[1];
+}
+
+async function getTableRows(url: string, tableId: string, newLinkTitle?: string) {
+		let pageNumber = 1;
+		const maxPages = 100; // Safety limit to prevent infinite loops
+
+		let newLinkUrl = null;
+		const allRows = [];
+	
+		while (pageNumber <= maxPages) {
+			let pageUrl = url;
+			// Append page parameter if not the first page
+			if (pageNumber > 1) {
+				pageUrl += `?page=${pageNumber}`;
+			}
+	
+			try {
+				const html = await CM.client.get(pageUrl).text();
+				// get new link
+				if (newLinkTitle) {
+					const newLink = extractLinkFromHtmlByTitle(html, newLinkTitle);
+					newLinkUrl = newLink ? new URL(newLink, url) : undefined;
+				}
+				const rows = parseTable(html, tableId);
+	
+				if (rows.length === 0) {
+					// No rows found, stop pagination
+					break;
+				}
+	
+				allRows.push(...rows);
+	
+				// Look for next page link in the tfoot - check if page N+1 exists
+				const tfootMatch = html.match(/<tfoot[^>]*>[\s\S]*?<\/tfoot>/i);
+				if (!tfootMatch) {
+					break;
+				}
+	
+				const tfootHtml = tfootMatch[0];
+	
+				// Look for a link with the next page number as text
+				const nextPageNumber = pageNumber + 1;
+				const nextPageRegex = new RegExp(`<a[^>]*href="([^"]*)"[^>]*>\\s*${nextPageNumber}\\s*</a>`, 'i');
+				const nextPageMatch = tfootHtml.match(nextPageRegex);
+	
+				if (!nextPageMatch) {
+					// No next page link found, we're done
+					break;
+				}
+	
+				pageNumber++;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				console.warn(`Failed to fetch page ${pageNumber}: ${message}`);
+				break;
+			}
+		}
+		return allRows;
 }
 
 
@@ -641,18 +805,19 @@ class HTMLModule extends File {
 class NotificationTemplate extends File {
 	parent: NotificationTemplatesDirectory;
 	url: string;
+	fields: Map<string, string>;
 	constructor(name: string, parent: NotificationTemplatesDirectory, url: string) {
 		super(name, parent);
 		this.parent = parent;
-		this.url = url;
+		this.url = this.url = new URL(url, parent.url).toString();
+		this.fields = new Map<string, string>();
 	}
 
-	
 	async load() {
 		const html = await CM.client.get(this.url).text();
 
 		// Extract content from appropriate textarea
-		const contentMatch = html.match(/<textarea[^>]*id="txtTemplate"[^>]*>([\s\S]*?)<\/textarea>/i);
+		const contentMatch = html.match(/<textarea[^>]*id="txtTemplate"[^>]*>(?:\r\n)?([\s\S]*?)<\/textarea>/i);
 
 		if (!contentMatch) {
 			throw new Error(`Could not find HTML content in the fetched page for file: ${this.name}`);
@@ -673,6 +838,50 @@ class NotificationTemplate extends File {
 		this.data = new Uint8Array(contentBuffer);
 		this.size = this.data.length;
 		this.utime = Date.now();
+
+		this.fields.set('txtSubject', getFieldValue(html, 'txtSubject'));
+		this.fields.set('txtTemplate', unescaped);
+		this.fields.set('smMain', 'smMain|btnSave');
+		this.fields.set('__EVENTTARGET', 'btnSave');
+		this.fields.set('__EVENTARGUMENT', '');
+		this.fields.set('__VIEWSTATE', getFieldValue(html, '__VIEWSTATE'));
+		this.fields.set('__VIEWSTATEGENERATOR', getFieldValue(html, '__VIEWSTATEGENERATOR'));
+		this.fields.set('__EVENTVALIDATION', getFieldValue(html, '__EVENTVALIDATION'));
+		this.fields.set('__ASYNCPOST', 'true');
+		
+		this.utime = Date.now();
+	}
+
+	async save() {
+		if (!this.data) {
+			throw new Error(`No data loaded for file: ${this.name}. Please call load() before accessing content.`);
+		}
+
+		this.fields.set('txtTemplate',  Buffer.from(this.data).toString('utf-8'));
+
+		// Convert Map to URLSearchParams
+		const formData = new URLSearchParams();
+		for (const [key, value] of this.fields) {
+			formData.append(key, value);
+		}
+
+		const saveResponse = await CM.client.post(this.url, {
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+				'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+				// 'Referer': fullUrl,
+				// 'Origin': new URL(session.baseUrl).origin,
+				'Sec-Fetch-Dest': 'empty',
+				'Sec-Fetch-Mode': 'cors',
+				'Sec-Fetch-Site': 'same-origin',
+			},
+			body: formData.toString(),
+		});
+
+		if (saveResponse.statusCode !== 200) {
+			throw new Error(`Failed to save file: ${saveResponse.statusCode} ${saveResponse.statusMessage}`);
+		}
 	}
 }
 
